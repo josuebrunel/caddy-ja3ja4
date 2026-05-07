@@ -24,17 +24,28 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return next.ServeHTTP(w, r)
 	}
 
-	if conn, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok {
-		if fp, found := store.Load(conn); found {
-			rp.Set("tls.ja3", fp.JA3)
-			rp.Set("tls.ja4", fp.JA4)
-			rp.Set("tls.ja3_raw", fp.JA3Raw)
+	var fp TLSFingerprint
+	var found bool
 
-			if m.SortJA3Extensions {
-				rp.Set("tls.ja3_sorted", "true")
-			} else {
-				rp.Set("tls.ja3_sorted", "false")
-			}
+	if conn, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok {
+		fp, found = store.Load(conn)
+	}
+
+	if !found {
+		// Fallback for HTTP/3 where the net.Conn is not available in the request context.
+		// Use the remote address from the request to look up the fingerprint.
+		fp, found = store.LoadByRemoteAddr(r.RemoteAddr)
+	}
+
+	if found {
+		rp.Set("tls.ja3", fp.JA3)
+		rp.Set("tls.ja4", fp.JA4)
+		rp.Set("tls.ja3_raw", fp.JA3Raw)
+
+		if m.SortJA3Extensions {
+			rp.Set("tls.ja3_sorted", "true")
+		} else {
+			rp.Set("tls.ja3_sorted", "false")
 		}
 	}
 

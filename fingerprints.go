@@ -47,6 +47,18 @@ func (s *FingerprintStore) Load(conn net.Conn) (TLSFingerprint, bool) {
 	return fp, ok
 }
 
+// LoadByRemoteAddr retrieves the fingerprint by remote address string.
+// This is used as a fallback for HTTP/3 requests where the net.Conn is not available in the request context.
+func (s *FingerprintStore) LoadByRemoteAddr(remoteAddr string) (TLSFingerprint, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if remoteAddr == "" {
+		return TLSFingerprint{}, false
+	}
+	fp, ok := s.m[remoteAddr]
+	return fp, ok
+}
+
 // Delete removes the fingerprint for the given connection.
 func (s *FingerprintStore) Delete(conn net.Conn) {
 	s.mu.Lock()
