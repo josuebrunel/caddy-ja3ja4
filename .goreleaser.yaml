@@ -1,0 +1,74 @@
+version: 2
+
+project_name: caddy-ja3ja4
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: caddy-ja3ja4
+    main: ./cmd/caddy
+    binary: caddy-ja3ja4
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+      - goos: darwin
+        goarch: arm64
+        goarm: "7"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/caddyserver/caddy/v2.CustomVersion={{.Tag}}
+    tags:
+      - nobadger
+      - nomysql
+      - nopgx
+      - caddy
+
+archives:
+  - id: caddy-ja3ja4
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv7
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^test:"
+      - "^chore:"

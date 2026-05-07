@@ -3,6 +3,7 @@ package ja3ja4
 import (
 	"crypto/tls"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -162,4 +163,168 @@ func TestFingerprintStore(t *testing.T) {
 	}
 
 	s.Delete(nil) // should not panic
+}
+
+func TestComputeJA4_TLS13(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1301, 0x1302, 0x1303},
+		Extensions:        []uint16{0x0000, 0x0005, 0x000a, 0x000b, 0x0010, 0x0017, 0x001b, 0x0023, 0x002b, 0x002d, 0x0033, 0xff01},
+		SupportedCurves:   []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
+		SupportedPoints:   []uint8{0},
+		ServerName:        "example.com",
+		SupportedProtos:   []string{"h2", "http/1.1"},
+	}
+
+	ja4 := computeJA4(chi)
+
+	if ja4 == "" {
+		t.Fatal("JA4 should not be empty")
+	}
+	if ja4 == "n/a" {
+		t.Fatal("JA4 should not be 'n/a' for valid ClientHelloInfo")
+	}
+	// JA4 format: t[version][cipher_count][ext_count][alpn]_[hash1]_[hash2]
+	// Must start with 't' (TLS)
+	if ja4[0] != 't' {
+		t.Errorf("JA4 should start with 't', got %q", ja4[:1])
+	}
+	// Should contain two underscores (three segments)
+	parts := 0
+	for _, c := range ja4 {
+		if c == '_' {
+			parts++
+		}
+	}
+	if parts != 2 {
+		t.Errorf("JA4 should have two underscores (3 parts), got %d in %q", parts, ja4)
+	}
+}
+
+func TestComputeJA4_TLS12(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS12},
+		CipherSuites:      []uint16{0xc02b, 0xc02f, 0x009c},
+		Extensions:        []uint16{0x0000, 0x0005, 0x000a, 0x0017, 0x0023},
+		SupportedCurves:   []tls.CurveID{tls.CurveP256, tls.CurveP384},
+		SupportedPoints:   []uint8{0, 1},
+		ServerName:        "test.example.com",
+	}
+
+	ja4 := computeJA4(chi)
+
+	if ja4 == "" || ja4 == "n/a" {
+		t.Fatalf("expected valid JA4, got %q", ja4)
+	}
+	if ja4[0] != 't' {
+		t.Errorf("JA4 should start with 't', got %q", ja4[:1])
+	}
+}
+
+func TestComputeJA4_DifferentInputs(t *testing.T) {
+	chi1 := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1301, 0x1302},
+		Extensions:        []uint16{0x0000, 0x0005},
+		SupportedCurves:   []tls.CurveID{tls.CurveP256},
+		SupportedPoints:   []uint8{0},
+	}
+
+	chi2 := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS12},
+		CipherSuites:      []uint16{0xc02b, 0xc02f},
+		Extensions:        []uint16{0x0000, 0x0005},
+		SupportedCurves:   []tls.CurveID{tls.CurveP256},
+		SupportedPoints:   []uint8{0},
+	}
+
+	ja4a := computeJA4(chi1)
+	ja4b := computeJA4(chi2)
+
+	if ja4a == ja4b {
+		t.Errorf("JA4 fingerprints should differ for different TLS versions: both got %q", ja4a)
+	}
+}
+
+func TestComputeJA4_MinimalClientHello(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1301},
+		Extensions:        []uint16{0x0000},
+		SupportedCurves:   []tls.CurveID{tls.CurveP256},
+		SupportedPoints:   []uint8{0},
+	}
+
+	ja4 := computeJA4(chi)
+
+	if ja4 == "" || ja4 == "n/a" {
+		t.Fatalf("expected valid JA4 for minimal ClientHello, got %q", ja4)
+	}
+}
+
+func TestComputeJA4_Stability(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1301, 0x1302},
+		Extensions:        []uint16{0x0000, 0x0005, 0x0010},
+		SupportedCurves:   []tls.CurveID{tls.X25519, tls.CurveP256},
+		SupportedPoints:   []uint8{0},
+		ServerName:        "example.com",
+		SupportedProtos:   []string{"h2"},
+	}
+
+	// Same input should always produce the same JA4
+	ja4a := computeJA4(chi)
+	ja4b := computeJA4(chi)
+	ja4c := computeJA4(chi)
+
+	if ja4a != ja4b || ja4b != ja4c {
+		t.Errorf("JA4 should be stable across multiple calls: %q, %q, %q", ja4a, ja4b, ja4c)
+	}
+}
+
+func TestComputeJA4_VerifiedFingerprintFormat(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1301, 0x1302, 0x1303},
+		Extensions:        []uint16{0x0000, 0x0005, 0x000a, 0x000b, 0x0010},
+		SupportedCurves:   []tls.CurveID{tls.X25519, tls.CurveP256},
+		SupportedPoints:   []uint8{0},
+		ServerName:        "example.com",
+		SupportedProtos:   []string{"h2", "http/1.1"},
+	}
+
+	ja4 := computeJA4(chi)
+
+	// JA4 format: t[version][cipher_count][ext_count][alpn]_[hash1]_[hash2]
+	// The first segment should contain: t + version(2 digits) + cipher_count(2 hex) + ext_count(2 hex) + alpn(1 char)
+	// e.g. "t13d0315h2"
+	segments := strings.Split(ja4, "_")
+	if len(segments) != 3 {
+		t.Fatalf("expected 3 underscore-separated segments, got %d in %q", len(segments), ja4)
+	}
+
+	// First segment should start with "t" and have version info
+	prefix := segments[0]
+	if len(prefix) < 6 {
+		t.Errorf("JA4 prefix too short: %q", prefix)
+	}
+	if prefix[0] != 't' {
+		t.Errorf("JA4 prefix should start with 't', got %q", prefix[:1])
+	}
+
+	// Hash segments should be hex
+	for i, hash := range segments[1:] {
+		if hash == "" {
+			t.Errorf("JA4 hash segment %d is empty", i+1)
+			continue
+		}
+		// Verify it's valid hex
+		for _, c := range hash {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				t.Errorf("JA4 hash segment %d contains non-hex char %q in %q", i+1, string(c), hash)
+				break
+			}
+		}
+	}
 }

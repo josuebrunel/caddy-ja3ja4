@@ -1,5 +1,3 @@
-//go:build caddy
-
 package main
 
 import (
