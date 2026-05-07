@@ -1,0 +1,27 @@
+# Binaries
+caddy
+*.exe
+
+# Test data
+testdata/
+*.pem
+
+# Coverage
+coverage.out
+
+# Build artifacts
+bin/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/

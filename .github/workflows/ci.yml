@@ -12,30 +12,30 @@ jobs:
     strategy:
       matrix:
         go: ['1.25']
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go }}
         cache: true
-    
+
     - name: Generate test certificates
       run: make generate-certs
-    
+
     - name: Run unit tests
-      run: go test -v -race -short ./...
-    
-    - name: Run integration tests
-      run: go test -v -run Integration ./...
-    
+      run: make test
+
+    - name: Run tests with race detector
+      run: make test-race
+
     - name: Build with xcaddy
       run: |
         go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
         xcaddy build --with github.com/josuebrunel/caddy-ja3ja4=.
-    
+
     - name: Verify binary
       run: ./caddy version
 

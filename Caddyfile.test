@@ -1,0 +1,17 @@
+{
+    order ja3_ja4 first
+    auto_https off
+}
+
+localhost:8443 {
+    tls ./testdata/cert.pem ./testdata/key.pem
+
+    ja3_ja4
+
+    log {
+        output stdout
+        format json
+    }
+
+    respond "JA3: {tls.ja3}\nJA4: {tls.ja4}\nJA3 Raw: {tls.ja3_raw}\nSorted: {tls.ja3_sorted}\n" 200
+}

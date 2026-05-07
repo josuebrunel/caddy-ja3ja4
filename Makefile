@@ -1,22 +1,34 @@
-.PHONY: build test lint clean xcaddy
+.PHONY: build test test-race test-coverage lint vet fmt mod-tidy clean xcaddy generate-certs docker-build docker-up docker-down
 
 BINARY := caddy
-MODULE := github.com/yourorg/caddy-ja3ja4
+MODULE := github.com/josuebrunel/caddy-ja3ja4
 
 build:
-	go build -o $(BINARY) ./cmd/caddy
+	go build -tags caddy -o $(BINARY) ./cmd/caddy
 
 test:
-	go test -v -race ./...
+	go test -v -short ./...
 
-test-integration:
-	go test -v -run Integration ./...
+test-race:
+	go test -v -race -short ./...
+
+test-coverage:
+	go test -v -race -coverprofile=coverage.out -short ./...
 
 lint:
-	golangci-lint run
+	golangci-lint run --timeout=5m
+
+vet:
+	go vet ./...
+
+fmt:
+	go fmt ./...
+
+mod-tidy:
+	go mod tidy
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) coverage.out
 	go clean -cache -testcache
 
 xcaddy:
@@ -26,6 +38,13 @@ xcaddy:
 
 generate-certs:
 	mkdir -p testdata
-	openssl req -x509 -newkey rsa:2048 -keyout testdata/key.pem -out testdata/cert.pem -days 1 -nodes -subj "/CN=localhost" 2>/dev/null
+	openssl req -x509 -newkey rsa:2048 -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj "/CN=localhost" 2>/dev/null
 
-ci-test: generate-certs test
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d
+
+docker-down:
+	docker compose down
