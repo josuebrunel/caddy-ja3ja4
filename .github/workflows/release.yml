@@ -19,6 +19,9 @@ on:
 permissions:
   contents: write
 
+env:
+  NODE_NO_WARNINGS: 1
+
 jobs:
   # --- workflow_dispatch path: compute the new version ---
   bump:
