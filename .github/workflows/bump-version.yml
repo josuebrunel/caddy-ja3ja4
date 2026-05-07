@@ -1,0 +1,63 @@
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest tag
+        id: latest
+        run: |
+          LATEST=$(git tag -l 'v*' --sort=-v:refname | head -n 1)
+          if [ -z "$LATEST" ]; then
+            echo "tag=v0.0.0" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$LATEST" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compute new version
+        id: bump
+        run: |
+          CURRENT="${{ steps.latest.outputs.tag }}"
+          VERSION="${CURRENT#v}"
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+
+          BUMP="${{ github.event.inputs.bump }}"
+          if [ "$BUMP" = "major" ]; then
+            NEW="$((MAJOR + 1)).0.0"
+          elif [ "$BUMP" = "minor" ]; then
+            NEW="${MAJOR}.$((MINOR + 1)).0"
+          else
+            NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "new=v$NEW" >> $GITHUB_OUTPUT
+          echo "$CURRENT → v$NEW"
+
+      - name: Push tag
+        run: |
+          git tag ${{ steps.bump.outputs.new }}
+          git push origin ${{ steps.bump.outputs.new }}
