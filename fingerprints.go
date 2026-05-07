@@ -74,6 +74,16 @@ type TLSFingerprint struct {
 	JA4    string
 }
 
+// isGREASE reports whether v is a GREASE value as defined in RFC 8701.
+// GREASE values follow the pattern where both bytes are equal and the low nibble
+// of each byte is 0xA (e.g. 0x0A0A, 0x1A1A, 0x2A2A, …, 0xFAFA).
+// The canonical JA3 specification excludes GREASE values from all fields.
+func isGREASE(v uint16) bool {
+	lo := byte(v)
+	hi := byte(v >> 8)
+	return lo == hi && lo&0x0f == 0x0a
+}
+
 // computeFingerprints computes JA3 (raw + hash) and JA4 from a ClientHello.
 func computeFingerprints(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string, string) {
 	if chi == nil {
@@ -87,6 +97,11 @@ func computeFingerprints(chi *tls.ClientHelloInfo, sortExtensions bool) (string,
 }
 
 // computeJA3 builds the JA3 fingerprint string and its MD5 hash.
+//
+// Known deviation: Go's crypto/tls does not expose the raw ClientHello.client_version
+// field. This implementation uses SupportedVersions[0] as a best-effort approximation.
+// For TLS 1.3 clients this yields 0x0304 rather than the legacy 0x0303 that reference
+// implementations (e.g. Wireshark/tshark) produce, so hashes will differ for those clients.
 func computeJA3(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string) {
 	if chi == nil {
 		return "0,,,", ""
@@ -112,40 +127,6 @@ func computeJA4(chi *tls.ClientHelloInfo) string {
 	return ja4plus.JA4(chi)
 }
 
-// cloneClientHelloWithSortedExtensions returns a deep copy of chi with
-// extensions sorted by ID. The original chi is not modified.
-func cloneClientHelloWithSortedExtensions(chi *tls.ClientHelloInfo) *tls.ClientHelloInfo {
-	if chi == nil {
-		return nil
-	}
-
-	cloned := &tls.ClientHelloInfo{
-		CipherSuites:      make([]uint16, len(chi.CipherSuites)),
-		ServerName:        chi.ServerName,
-		SupportedCurves:   make([]tls.CurveID, len(chi.SupportedCurves)),
-		SupportedPoints:   make([]uint8, len(chi.SupportedPoints)),
-		SignatureSchemes:  make([]tls.SignatureScheme, len(chi.SignatureSchemes)),
-		SupportedProtos:   make([]string, len(chi.SupportedProtos)),
-		SupportedVersions: make([]uint16, len(chi.SupportedVersions)),
-		Extensions:        make([]uint16, len(chi.Extensions)),
-		Conn:              chi.Conn,
-	}
-
-	copy(cloned.CipherSuites, chi.CipherSuites)
-	copy(cloned.SupportedCurves, chi.SupportedCurves)
-	copy(cloned.SupportedPoints, chi.SupportedPoints)
-	copy(cloned.SignatureSchemes, chi.SignatureSchemes)
-	copy(cloned.SupportedProtos, chi.SupportedProtos)
-	copy(cloned.SupportedVersions, chi.SupportedVersions)
-	copy(cloned.Extensions, chi.Extensions)
-
-	sort.Slice(cloned.Extensions, func(i, j int) bool {
-		return cloned.Extensions[i] < cloned.Extensions[j]
-	})
-
-	return cloned
-}
-
 func ja3Version(chi *tls.ClientHelloInfo) string {
 	if chi == nil || len(chi.SupportedVersions) == 0 {
 		return "0"
@@ -157,9 +138,11 @@ func ja3Ciphers(chi *tls.ClientHelloInfo) string {
 	if chi == nil || len(chi.CipherSuites) == 0 {
 		return ""
 	}
-	ciphers := make([]string, len(chi.CipherSuites))
-	for i, cipher := range chi.CipherSuites {
-		ciphers[i] = fmt.Sprintf("%d", cipher)
+	ciphers := make([]string, 0, len(chi.CipherSuites))
+	for _, cipher := range chi.CipherSuites {
+		if !isGREASE(cipher) {
+			ciphers = append(ciphers, fmt.Sprintf("%d", cipher))
+		}
 	}
 	return strings.Join(ciphers, "-")
 }
@@ -168,8 +151,12 @@ func ja3Extensions(chi *tls.ClientHelloInfo, sortExts bool) string {
 	if chi == nil || len(chi.Extensions) == 0 {
 		return ""
 	}
-	exts := make([]uint16, len(chi.Extensions))
-	copy(exts, chi.Extensions)
+	exts := make([]uint16, 0, len(chi.Extensions))
+	for _, ext := range chi.Extensions {
+		if !isGREASE(ext) {
+			exts = append(exts, ext)
+		}
+	}
 	if sortExts {
 		sort.Slice(exts, func(i, j int) bool { return exts[i] < exts[j] })
 	}
@@ -184,9 +171,11 @@ func ja3Curves(chi *tls.ClientHelloInfo, sortExts bool) string {
 	if chi == nil || len(chi.SupportedCurves) == 0 {
 		return ""
 	}
-	curves := make([]uint16, len(chi.SupportedCurves))
-	for i, c := range chi.SupportedCurves {
-		curves[i] = uint16(c)
+	curves := make([]uint16, 0, len(chi.SupportedCurves))
+	for _, c := range chi.SupportedCurves {
+		if !isGREASE(uint16(c)) {
+			curves = append(curves, uint16(c))
+		}
 	}
 	if sortExts {
 		sort.Slice(curves, func(i, j int) bool { return curves[i] < curves[j] })
@@ -212,9 +201,4 @@ func ja3PointFormats(chi *tls.ClientHelloInfo, sortExts bool) string {
 		formatStrs[i] = fmt.Sprintf("%d", format)
 	}
 	return strings.Join(formatStrs, "-")
-}
-
-// GetFingerprintFromContext is deprecated. Use the store directly.
-func GetFingerprintFromContext(ctx interface{}) (TLSFingerprint, bool) {
-	return TLSFingerprint{}, false
 }

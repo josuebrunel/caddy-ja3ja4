@@ -1,10 +1,17 @@
 package ja3ja4
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestComputeJA3_NilInput(t *testing.T) {
@@ -117,27 +124,30 @@ func TestJA3Helpers_NilInput(t *testing.T) {
 	}
 }
 
-func TestCloneClientHelloWithSortedExtensions(t *testing.T) {
+func TestJA3Extensions_SortingDoesNotMutateInput(t *testing.T) {
 	chi := &tls.ClientHelloInfo{
 		Extensions: []uint16{0x0010, 0x0000, 0x0005},
 	}
+	original := []uint16{0x0010, 0x0000, 0x0005}
 
-	cloned := cloneClientHelloWithSortedExtensions(chi)
+	// Sorting must not mutate the original slice.
+	_ = ja3Extensions(chi, true)
 
-	if !reflect.DeepEqual(chi.Extensions, []uint16{0x0010, 0x0000, 0x0005}) {
-		t.Error("original was modified")
-	}
-
-	if !reflect.DeepEqual(cloned.Extensions, []uint16{0x0000, 0x0005, 0x0010}) {
-		t.Errorf("expected sorted extensions, got %v", cloned.Extensions)
+	if !reflect.DeepEqual(chi.Extensions, original) {
+		t.Errorf("ja3Extensions(sort=true) mutated original Extensions: %v", chi.Extensions)
 	}
 }
 
-func TestCloneClientHelloWithSortedExtensions_Nil(t *testing.T) {
-	if got := cloneClientHelloWithSortedExtensions(nil); got != nil {
-		t.Error("expected nil for nil input")
+func TestJA3Extensions_SortedOutput(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		Extensions: []uint16{0x0010, 0x0000, 0x0005},
+	}
+	got := ja3Extensions(chi, true)
+	if got != "0-5-16" {
+		t.Errorf("expected sorted extensions '0-5-16', got %q", got)
 	}
 }
+
 
 func TestComputeJA4_NilInput(t *testing.T) {
 	ja4 := computeJA4(nil)
@@ -326,5 +336,148 @@ func TestComputeJA4_VerifiedFingerprintFormat(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GREASE filtering
+// ---------------------------------------------------------------------------
+
+func TestIsGREASE(t *testing.T) {
+	greaseValues := []uint16{
+		0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a,
+		0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a,
+		0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+	}
+	for _, v := range greaseValues {
+		if !isGREASE(v) {
+			t.Errorf("isGREASE(%#04x) should be true", v)
+		}
+	}
+	nonGREASE := []uint16{0x0000, 0x0005, 0x000a, 0xc02b, 0x1301, tls.VersionTLS13}
+	for _, v := range nonGREASE {
+		if isGREASE(v) {
+			t.Errorf("isGREASE(%#04x) should be false", v)
+		}
+	}
+}
+
+func TestJA3CiphersFiltersGREASE(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		CipherSuites: []uint16{0x0a0a, 0xc02b, 0x1a1a, 0xc02f},
+	}
+	got := ja3Ciphers(chi)
+	if strings.Contains(got, "2570") { // 0x0a0a decimal
+		t.Errorf("GREASE cipher 0x0a0a should be filtered, got %q", got)
+	}
+	if got != "49195-49199" {
+		t.Errorf("expected '49195-49199' after GREASE filter, got %q", got)
+	}
+}
+
+func TestJA3ExtensionsFiltersGREASE(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		Extensions: []uint16{0x0a0a, 0x0000, 0x2a2a, 0x0005},
+	}
+	got := ja3Extensions(chi, false)
+	if strings.Contains(got, "2570") || strings.Contains(got, "10794") {
+		t.Errorf("GREASE extensions should be filtered, got %q", got)
+	}
+	if got != "0-5" {
+		t.Errorf("expected '0-5' after GREASE filter, got %q", got)
+	}
+}
+
+func TestJA3CurvesFiltersGREASE(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedCurves: []tls.CurveID{tls.CurveID(0x0a0a), tls.CurveP256, tls.CurveID(0x1a1a)},
+	}
+	got := ja3Curves(chi, false)
+	if strings.Contains(got, "2570") || strings.Contains(got, "6682") {
+		t.Errorf("GREASE curves should be filtered, got %q", got)
+	}
+	if got != "23" {
+		t.Errorf("expected '23' after GREASE filter, got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ServeHTTP placeholder injection
+// ---------------------------------------------------------------------------
+
+// mockConn is a minimal net.Conn for testing; only RemoteAddr is used.
+type mockConn struct {
+	net.Conn
+	remoteAddr net.Addr
+}
+
+func (m *mockConn) RemoteAddr() net.Addr { return m.remoteAddr }
+
+type mockAddr struct{ s string }
+
+func (a *mockAddr) Network() string { return "tcp" }
+func (a *mockAddr) String() string  { return a.s }
+
+func TestServeHTTP_PlaceholderInjection(t *testing.T) {
+	conn := &mockConn{remoteAddr: &mockAddr{s: "1.2.3.4:9999"}}
+
+	fp := TLSFingerprint{JA3: "abc123", JA3Raw: "771,49195,,23,0", JA4: "t13d0100h2_abc_def"}
+	store.Store(conn, fp)
+	defer store.Delete(conn)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, connCtxKey{}, net.Conn(conn))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextCalled := false
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		nextCalled = true
+		return nil
+	})
+
+	m := &JA3JA4{SortJA3Extensions: false}
+	if err := m.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+	if !nextCalled {
+		t.Error("next handler was not called")
+	}
+
+	cases := []struct{ key, want string }{
+		{"tls.ja3", fp.JA3},
+		{"tls.ja3_raw", fp.JA3Raw},
+		{"tls.ja4", fp.JA4},
+		{"tls.ja3_sorted", "false"},
+	}
+	for _, tc := range cases {
+		got := repl.ReplaceAll("{"+tc.key+"}", "")
+		if got != tc.want {
+			t.Errorf("%s: expected %q, got %q", tc.key, tc.want, got)
+		}
+	}
+}
+
+func TestServeHTTP_NoConn_CallsNext(t *testing.T) {
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+
+	nextCalled := false
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		nextCalled = true
+		return nil
+	})
+
+	m := &JA3JA4{}
+	if err := m.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !nextCalled {
+		t.Error("next handler was not called when conn missing")
 	}
 }

@@ -43,7 +43,14 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 // connContextFunc is registered via Server.RegisterConnContext during
 // Provision. It stores the net.Conn in the request context so that
-// ServeHTTP can look up the associated fingerprint.
+// ServeHTTP can look up the associated fingerprint. It also registers a
+// cleanup callback that removes the fingerprint from the store when the
+// connection's context is cancelled (i.e. the connection is closed),
+// preventing unbounded memory growth.
 func connContextFunc(ctx context.Context, c net.Conn) context.Context {
-	return context.WithValue(ctx, connCtxKey{}, c)
+	ctx = context.WithValue(ctx, connCtxKey{}, c)
+	context.AfterFunc(ctx, func() {
+		store.Delete(c)
+	})
+	return ctx
 }

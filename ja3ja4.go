@@ -19,9 +19,12 @@ func init() {
 // JA3JA4 is a Caddy HTTP module that computes JA3 and JA4 TLS fingerprints
 // and exposes them as request placeholders.
 type JA3JA4 struct {
-	// SortJA3Extensions sorts TLS extensions by ID before JA3 computation.
-	// This mitigates evasion via extension randomization but may increase
-	// false positives. Default: false (preserve original order per JA3 spec).
+	// SortJA3Extensions sorts TLS extensions, elliptic curves, and point
+	// formats by numeric ID before JA3 computation. This normalises
+	// fingerprints for clients that randomise extension order, mitigating
+	// one common evasion technique, but may increase false positives because
+	// legitimate tools (curl, browsers) may then collide with bots.
+	// Default: false (preserve wire order per the JA3 specification).
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
 	logger *zap.Logger
@@ -62,7 +65,11 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 	}
 
 	for _, cp := range srv.TLSConnPolicies {
-		cp.HandshakeContextRaw = hcJSON
+		// Only inject if nothing else has already claimed the handshake context
+		// slot; overwriting another module's config would silently break it.
+		if cp.HandshakeContextRaw == nil {
+			cp.HandshakeContextRaw = hcJSON
+		}
 	}
 
 	srv.RegisterConnContext(connContextFunc)
