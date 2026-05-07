@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write
 
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   bump:
     runs-on: ubuntu-latest
@@ -37,17 +40,19 @@ jobs:
 
       - name: Compute new version
         id: bump
+        env:
+          CURRENT_TAG: ${{ steps.latest.outputs.tag }}
+          BUMP_TYPE: ${{ github.event.inputs.bump }}
         run: |
-          CURRENT="${{ steps.latest.outputs.tag }}"
+          CURRENT="$CURRENT_TAG"
           VERSION="${CURRENT#v}"
-          MAJOR=$(echo $VERSION | cut -d. -f1)
-          MINOR=$(echo $VERSION | cut -d. -f2)
-          PATCH=$(echo $VERSION | cut -d. -f3)
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
 
-          BUMP="${{ github.event.inputs.bump }}"
-          if [ "$BUMP" = "major" ]; then
+          if [ "$BUMP_TYPE" = "major" ]; then
             NEW="$((MAJOR + 1)).0.0"
-          elif [ "$BUMP" = "minor" ]; then
+          elif [ "$BUMP_TYPE" = "minor" ]; then
             NEW="${MAJOR}.$((MINOR + 1)).0"
           else
             NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
@@ -55,9 +60,11 @@ jobs:
 
           echo "current=$CURRENT" >> $GITHUB_OUTPUT
           echo "new=v$NEW" >> $GITHUB_OUTPUT
-          echo "$CURRENT → v$NEW"
+          echo "$CURRENT -> v$NEW"
 
       - name: Push tag
         run: |
-          git tag ${{ steps.bump.outputs.new }}
-          git push origin ${{ steps.bump.outputs.new }}
+          git tag "$NEW_TAG"
+          git push origin "$NEW_TAG"
+        env:
+          NEW_TAG: ${{ steps.bump.outputs.new }}
