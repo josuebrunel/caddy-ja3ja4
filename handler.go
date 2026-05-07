@@ -43,14 +43,22 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 // connContextFunc is registered via Server.RegisterConnContext during
 // Provision. It stores the net.Conn in the request context so that
-// ServeHTTP can look up the associated fingerprint. It also registers a
-// cleanup callback that removes the fingerprint from the store when the
-// connection's context is cancelled (i.e. the connection is closed),
-// preventing unbounded memory growth.
+// ServeHTTP can look up the associated fingerprint.
+//
+// NOTE: We do NOT register a cleanup callback here because in Caddy's
+// connection handling, the context passed to this function may be
+// cancelled after individual requests on keep-alive connections, not
+// just when the TCP connection itself closes. Registering a cleanup
+// via context.AfterFunc would prematurely delete the fingerprint from
+// the store, causing {tls.ja3} / {tls.ja4} placeholders to appear
+// unsubstituted on subsequent requests on the same keep-alive connection.
+//
+// The global FingerprintStore is bounded by the number of concurrent
+// TCP connections, which is already limited by the system. Entries for
+// closed connections become harmless stale data that are garbage-collected
+// naturally when new connections from different remote addresses are
+// stored. If the same client reconnects (with a new ephemeral port), a
+// new entry is created and the old entry is simply ignored.
 func connContextFunc(ctx context.Context, c net.Conn) context.Context {
-	ctx = context.WithValue(ctx, connCtxKey{}, c)
-	context.AfterFunc(ctx, func() {
-		store.Delete(c)
-	})
-	return ctx
+	return context.WithValue(ctx, connCtxKey{}, c)
 }
