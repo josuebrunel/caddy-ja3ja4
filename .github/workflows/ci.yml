@@ -8,36 +8,37 @@ on:
 
 env:
   NODE_NO_WARNINGS: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: ['1.24']
+        go: [ "1.24" ]
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ matrix.go }}
-        cache: true
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
 
-    - name: Generate test certificates
-      run: make generate-certs
+      - name: Generate test certificates
+        run: make generate-certs
 
-    - name: Run unit tests
-      run: make test
+      - name: Run unit tests
+        run: make test
 
-    - name: Run tests with race detector
-      run: make test-race
+      - name: Run tests with race detector
+        run: make test-race
 
-    - name: Build with xcaddy
-      run: |
-        go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-        xcaddy build --with github.com/josuebrunel/caddy-ja3ja4=.
+      - name: Build with xcaddy
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          xcaddy build --with github.com/josuebrunel/caddy-ja3ja4=.
 
-    - name: Verify binary
-      run: ./caddy version
+      - name: Verify binary
+        run: ./caddy version
