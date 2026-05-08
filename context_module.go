@@ -51,7 +51,10 @@ func (m *HandshakeContextModule) UnmarshalCaddyfile(d *caddyfile.Dispenser) erro
 }
 
 // HandshakeContext is invoked during the TLS handshake. It computes
-// JA3/JA4 fingerprints and stores them keyed by the remote address.
+// JA3/JA4 fingerprints and embeds them in the returned context so
+// that ServeHTTP can retrieve them directly. The fingerprint is also
+// stored in the global store as a backup for HTTP/3 and other edge
+// cases where context propagation may not reach the request handler.
 func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
 	if hello == nil || hello.Conn == nil {
 		return hello.Context(), nil
@@ -59,13 +62,16 @@ func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (c
 
 	ja3Raw, ja3, ja4 := computeFingerprints(hello, m.SortJA3Extensions)
 
-	store.Store(hello.Conn, TLSFingerprint{
+	fp := TLSFingerprint{
 		JA3:    ja3,
 		JA3Raw: ja3Raw,
 		JA4:    ja4,
-	})
+	}
 
-	return hello.Context(), nil
+	store.Store(hello.Conn, fp)
+
+	ctx := context.WithValue(hello.Context(), fpCtxKey{}, fp)
+	return ctx, nil
 }
 
 // Interface compliance.

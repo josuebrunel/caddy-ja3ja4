@@ -10,10 +10,16 @@ import (
 )
 
 type connCtxKey struct{}
+type fpCtxKey struct{}
 
 // ServeHTTP implements the middleware handler. It retrieves the net.Conn
 // from the request context, looks up the JA3/JA4 fingerprint in the
 // global store, and sets placeholders on the replacer.
+//
+// The lookup order is:
+//  1. TLSFingerprint embedded directly in the request context (via HandshakeContext callback)
+//  2. net.Conn value in the request context → global store lookup by remote address
+//  3. RemoteAddr from the request → global store lookup by remote address (HTTP/3 fallback)
 func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey)
 	if repl == nil {
@@ -27,12 +33,16 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	var fp TLSFingerprint
 	var found bool
 
-	if conn, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok {
-		fp, found = store.Load(conn)
+	// 1. Check if the fingerprint was embedded directly in the context by HandshakeContext.
+	if fp, found = r.Context().Value(fpCtxKey{}).(TLSFingerprint); !found {
+		// 2. Fallback to looking up in the global store via the net.Conn from the request context.
+		if conn, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok {
+			fp, found = store.Load(conn)
+		}
 	}
 
 	if !found {
-		// Fallback for HTTP/3 where the net.Conn is not available in the request context.
+		// 3. Fallback for HTTP/3 where the net.Conn is not available in the request context.
 		// Use the remote address from the request to look up the fingerprint.
 		fp, found = store.LoadByRemoteAddr(r.RemoteAddr)
 	}
