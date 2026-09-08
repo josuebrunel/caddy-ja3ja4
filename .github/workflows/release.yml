@@ -32,7 +32,7 @@ jobs:
       new_tag: ${{ steps.bump.outputs.new }}
       current: ${{ steps.bump.outputs.current }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -78,7 +78,7 @@ jobs:
     if: always() && (github.event_name == 'push' || (needs.bump.result ==
       'success'))
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -108,7 +108,7 @@ jobs:
     needs: [ test, bump ]
     if: always() && needs.test.result == 'success'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
