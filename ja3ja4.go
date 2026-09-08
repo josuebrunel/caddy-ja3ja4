@@ -74,6 +74,8 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 
 	srv.RegisterConnContext(connContextFunc)
 
+	store.StartSweeper(ctx.Context)
+
 	return nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -173,6 +174,67 @@ func TestFingerprintStore(t *testing.T) {
 	}
 
 	s.Delete(nil) // should not panic
+}
+
+func TestFingerprintStore_SweepEvictsIdleEntries(t *testing.T) {
+	s := NewFingerprintStore()
+	conn := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.1:1111"}}
+	s.Store(conn, TLSFingerprint{JA3: "abc"})
+
+	s.sweep(0) // TTL of 0 makes any untouched entry immediately stale
+
+	if _, ok := s.Load(conn); ok {
+		t.Error("expected entry to be evicted by sweep")
+	}
+}
+
+func TestFingerprintStore_LoadRefreshesLastSeen(t *testing.T) {
+	s := NewFingerprintStore()
+	conn := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.2:2222"}}
+	s.Store(conn, TLSFingerprint{JA3: "abc"})
+
+	// Simulate the entry aging past what a short TTL would allow, then
+	// "use" it via Load before sweeping with that TTL. It must survive.
+	key := connKey(conn)
+	s.mu.RLock()
+	e := s.m[key]
+	s.mu.RUnlock()
+	e.lastSeen.Store(time.Now().Add(-time.Hour).UnixNano())
+
+	if _, ok := s.Load(conn); !ok {
+		t.Fatal("expected entry to still be present before sweep")
+	}
+
+	s.sweep(time.Minute)
+
+	if _, ok := s.Load(conn); !ok {
+		t.Error("expected active entry (refreshed via Load) to survive the sweep")
+	}
+}
+
+func TestFingerprintStore_StartSweeperStopsOnContextDone(t *testing.T) {
+	s := NewFingerprintStore()
+	conn := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.3:3333"}}
+	s.Store(conn, TLSFingerprint{JA3: "abc"})
+
+	key := connKey(conn)
+	s.mu.RLock()
+	e := s.m[key]
+	s.mu.RUnlock()
+	e.lastSeen.Store(0) // already stale
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the sweeper's first tick fires
+
+	s.StartSweeper(ctx)
+
+	// Give the goroutine a moment to observe ctx.Done() and return; since ctx
+	// is already cancelled it should exit before ever sweeping.
+	time.Sleep(50 * time.Millisecond)
+
+	if _, ok := s.Load(conn); !ok {
+		t.Error("expected sweeper to have stopped before evicting the entry")
+	}
 }
 
 func TestComputeJA4_TLS13(t *testing.T) {

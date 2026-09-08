@@ -74,12 +74,11 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 // the store, causing {tls.ja3} / {tls.ja4} placeholders to appear
 // unsubstituted on subsequent requests on the same keep-alive connection.
 //
-// The global FingerprintStore is bounded by the number of concurrent
-// TCP connections, which is already limited by the system. Entries for
-// closed connections become harmless stale data that are garbage-collected
-// naturally when new connections from different remote addresses are
-// stored. If the same client reconnects (with a new ephemeral port), a
-// new entry is created and the old entry is simply ignored.
+// Instead, the global FingerprintStore uses a sliding TTL: every lookup
+// refreshes the entry's last-seen timestamp, and a background sweeper
+// (started in JA3JA4.Provision via FingerprintStore.StartSweeper) reclaims
+// entries that go unused past that TTL. This bounds memory usage without
+// ever evicting a fingerprint that's still actively in use.
 func connContextFunc(ctx context.Context, c net.Conn) context.Context {
 	return context.WithValue(ctx, connCtxKey{}, c)
 }

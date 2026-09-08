@@ -1,6 +1,7 @@
 package ja3ja4
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/tls"
 	"fmt"
@@ -8,65 +9,123 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/exaring/ja4plus"
 )
 
+const (
+	// fingerprintTTL is how long a fingerprint entry may sit unused before the
+	// sweeper reclaims it. It must comfortably exceed Caddy's default idle
+	// timeout so entries for live keep-alive connections are never evicted
+	// (Load/LoadByRemoteAddr refresh the timestamp on every hit).
+	fingerprintTTL = 5 * time.Minute
+	// sweepInterval is how often the background sweeper scans for expired entries.
+	sweepInterval = 1 * time.Minute
+)
+
+// fingerprintEntry pairs a fingerprint with a last-seen timestamp (unix nano)
+// that is refreshed on every read, so the sweeper only reclaims entries for
+// connections that have gone idle or closed without a cleanup hook.
+type fingerprintEntry struct {
+	fp       TLSFingerprint
+	lastSeen atomic.Int64
+}
+
 // FingerprintStore is a thread-safe store for TLS fingerprints keyed by connection.
 type FingerprintStore struct {
 	mu sync.RWMutex
-	m  map[string]TLSFingerprint
+	m  map[string]*fingerprintEntry
 }
 
 // NewFingerprintStore creates a new fingerprint store.
 func NewFingerprintStore() *FingerprintStore {
 	return &FingerprintStore{
-		m: make(map[string]TLSFingerprint),
+		m: make(map[string]*fingerprintEntry),
 	}
 }
 
 // Store saves a fingerprint for the given connection.
 func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) {
+	key := connKey(conn)
+	if key == "" {
+		return
+	}
+	e := &fingerprintEntry{fp: fp}
+	e.lastSeen.Store(time.Now().UnixNano())
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := connKey(conn)
-	if key != "" {
-		s.m[key] = fp
-	}
+	s.m[key] = e
 }
 
 // Load retrieves the fingerprint for the given connection.
 func (s *FingerprintStore) Load(conn net.Conn) (TLSFingerprint, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	key := connKey(conn)
-	if key == "" {
-		return TLSFingerprint{}, false
-	}
-	fp, ok := s.m[key]
-	return fp, ok
+	return s.LoadByRemoteAddr(connKey(conn))
 }
 
 // LoadByRemoteAddr retrieves the fingerprint by remote address string.
 // This is used as a fallback for HTTP/3 requests where the net.Conn is not available in the request context.
 func (s *FingerprintStore) LoadByRemoteAddr(remoteAddr string) (TLSFingerprint, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if remoteAddr == "" {
 		return TLSFingerprint{}, false
 	}
-	fp, ok := s.m[remoteAddr]
-	return fp, ok
+
+	s.mu.RLock()
+	e, ok := s.m[remoteAddr]
+	s.mu.RUnlock()
+	if !ok {
+		return TLSFingerprint{}, false
+	}
+
+	e.lastSeen.Store(time.Now().UnixNano())
+	return e.fp, true
 }
 
 // Delete removes the fingerprint for the given connection.
 func (s *FingerprintStore) Delete(conn net.Conn) {
+	key := connKey(conn)
+	if key == "" {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := connKey(conn)
-	if key != "" {
-		delete(s.m, key)
+	delete(s.m, key)
+}
+
+// sweep removes entries that have not been touched (via Store or a Load hit)
+// within ttl. Long-lived, actively-used connections never expire since every
+// lookup refreshes lastSeen; only idle or closed connections' entries age out.
+func (s *FingerprintStore) sweep(ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl).UnixNano()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, e := range s.m {
+		if e.lastSeen.Load() < cutoff {
+			delete(s.m, key)
+		}
 	}
+}
+
+// StartSweeper launches a background goroutine that periodically reclaims
+// stale fingerprint entries. It stops when ctx is done, so callers should tie
+// ctx to the lifetime of the module that started it (e.g. a Caddy module's
+// provisioning context).
+func (s *FingerprintStore) StartSweeper(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(sweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.sweep(fingerprintTTL)
+			}
+		}
+	}()
 }
 
 func connKey(conn net.Conn) string {
