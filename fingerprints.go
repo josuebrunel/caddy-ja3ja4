@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -212,7 +213,7 @@ func ja3Ciphers(chi *tls.ClientHelloInfo) string {
 	ciphers := make([]string, 0, len(chi.CipherSuites))
 	for _, cipher := range chi.CipherSuites {
 		if !isGREASE(cipher) {
-			ciphers = append(ciphers, fmt.Sprintf("%d", cipher))
+			ciphers = append(ciphers, strconv.FormatUint(uint64(cipher), 10))
 		}
 	}
 	return strings.Join(ciphers, "-")
@@ -233,7 +234,7 @@ func ja3Extensions(chi *tls.ClientHelloInfo, sortExts bool) string {
 	}
 	extStrs := make([]string, len(exts))
 	for i, ext := range exts {
-		extStrs[i] = fmt.Sprintf("%d", ext)
+		extStrs[i] = strconv.FormatUint(uint64(ext), 10)
 	}
 	return strings.Join(extStrs, "-")
 }
@@ -253,7 +254,7 @@ func ja3Curves(chi *tls.ClientHelloInfo, sortExts bool) string {
 	}
 	curveStrs := make([]string, len(curves))
 	for i, curve := range curves {
-		curveStrs[i] = fmt.Sprintf("%d", curve)
+		curveStrs[i] = strconv.FormatUint(uint64(curve), 10)
 	}
 	return strings.Join(curveStrs, "-")
 }
@@ -269,7 +270,7 @@ func ja3PointFormats(chi *tls.ClientHelloInfo, sortExts bool) string {
 	}
 	formatStrs := make([]string, len(formats))
 	for i, format := range formats {
-		formatStrs[i] = fmt.Sprintf("%d", format)
+		formatStrs[i] = strconv.FormatUint(uint64(format), 10)
 	}
 	return strings.Join(formatStrs, "-")
 }
