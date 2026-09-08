@@ -149,7 +149,6 @@ func TestJA3Extensions_SortedOutput(t *testing.T) {
 	}
 }
 
-
 func TestComputeJA4_NilInput(t *testing.T) {
 	ja4 := computeJA4(nil)
 	if ja4 != "n/a" {
@@ -393,7 +392,7 @@ func TestComputeJA4_VerifiedFingerprintFormat(t *testing.T) {
 		}
 		// Verify it's valid hex
 		for _, c := range hash {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 				t.Errorf("JA4 hash segment %d contains non-hex char %q in %q", i+1, string(c), hash)
 				break
 			}

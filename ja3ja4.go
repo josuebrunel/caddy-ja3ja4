@@ -44,7 +44,7 @@ func (JA3JA4) CaddyModule() caddy.ModuleInfo {
 func (m *JA3JA4) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
 
-	srvIface := ctx.Context.Value(caddyhttp.ServerCtxKey)
+	srvIface := ctx.Value(caddyhttp.ServerCtxKey)
 	if srvIface == nil {
 		m.logger.Warn("no server found in context; fingerprinting may not work")
 		return nil
