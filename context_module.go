@@ -56,7 +56,10 @@ func (m *HandshakeContextModule) UnmarshalCaddyfile(d *caddyfile.Dispenser) erro
 // stored in the global store as a backup for HTTP/3 and other edge
 // cases where context propagation may not reach the request handler.
 func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
-	if hello == nil || hello.Conn == nil {
+	if hello == nil {
+		return context.Background(), nil
+	}
+	if hello.Conn == nil {
 		return hello.Context(), nil
 	}
 

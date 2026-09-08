@@ -89,3 +89,15 @@ func TestHandshakeContextModule_Caddyfile(t *testing.T) {
 		t.Error("expected SortJA3Extensions to be true")
 	}
 }
+
+func TestHandshakeContextModule_NilHello(t *testing.T) {
+	mod := &HandshakeContextModule{}
+
+	ctx, err := mod.HandshakeContext(nil)
+	if err != nil {
+		t.Fatalf("expected no error for nil hello, got: %v", err)
+	}
+	if ctx == nil {
+		t.Fatal("expected a non-nil context for nil hello")
+	}
+}
