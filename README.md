@@ -12,7 +12,7 @@ A production-ready Caddy v2 module for TLS fingerprinting using [JA3](https://gi
 - **JA3 Fingerprinting** -- Full JA3 spec implementation: MD5 hash of TLS ClientHello parameters (version, ciphers, extensions, curves, point formats)
 - **JA4 Fingerprinting** -- Spec-compliant JA4 via `github.com/exaring/ja4plus` library
 - **Placeholder Integration** -- Expose fingerprints as `{tls.ja3}`, `{tls.ja4}`, `{tls.ja3_raw}`, and `{tls.ja3_sorted}` for use in logging, routing, headers, and matchers
-- **Zero Global Side Effects** -- Per-connection fingerprint storage preserves TLS session resumption
+- **Bounded Fingerprint Store** -- A sliding-TTL sweeper reclaims idle/closed connections' entries automatically, so long-running servers don't leak memory
 - **Extension Sorting** -- Optional `sort_ja3_extensions` flag to counter extension-randomization evasion techniques
 - **Graceful Degradation** -- Safely handles non-TLS connections, HTTP/3, and edge cases
 - **Caddy 2.11+ Compatible** -- Uses `tls.context` HandshakeContext module architecture
@@ -192,6 +192,9 @@ make test-coverage
 # Lint the codebase
 make lint
 
+# Check for known vulnerabilities in dependencies
+make vulncheck
+
 # Build with xcaddy
 make xcaddy
 
@@ -229,7 +232,7 @@ make docker-up
    - Caddy invokes `HandshakeContextModule.HandshakeContext(hello)`
    - JA3 is computed in pure Go (version, ciphers, extensions, curves, point formats)
    - JA4 is computed via `github.com/exaring/ja4plus`
-   - Fingerprints are stored in a `sync.Mutex`-protected map keyed by `conn.RemoteAddr()`
+   - Fingerprints are stored in a `sync.RWMutex`-protected map keyed by `conn.RemoteAddr()`, each entry carrying a last-seen timestamp
 
 3. **HTTP Request Phase**: When the request reaches the handler:
    - The `net.Conn` is retrieved from request context (via `ConnContext`)
@@ -238,10 +241,10 @@ make docker-up
 
 ### Why This Design?
 
-- **No global side effects**: Fingerprints are per-connection, not per-module
+- **Per-connection, not per-module**: Fingerprints are keyed by connection, not tied to a single handler instance
 - **Compatible with Caddy 2.11+**: Uses the `tls.context` HandshakeContext mechanism
-- **Thread-safe**: Uses `sync.Mutex` for the fingerprint store
-- **Graceful cleanup**: Connections are automatically removed from the store
+- **Thread-safe**: `sync.RWMutex` guards the map; per-entry last-seen timestamps use `atomic.Int64` so reads don't need the write lock
+- **Bounded memory**: A background sweeper (started in `Provision`, tied to the module's Caddy context) reclaims entries that go untouched past a TTL. Every lookup refreshes an entry's timestamp, so long-lived keep-alive connections are never evicted while still active -- only idle or closed ones age out
 
 ## Known Limitations
 

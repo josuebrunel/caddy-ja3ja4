@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-coverage lint vet fmt mod-tidy clean xcaddy generate-certs docker-build docker-up docker-down
+.PHONY: build test test-race test-coverage lint vet fmt mod-tidy vulncheck clean xcaddy generate-certs docker-build docker-up docker-down
 
 BINARY := caddy
 MODULE := github.com/josuebrunel/caddy-ja3ja4
@@ -26,6 +26,9 @@ fmt:
 
 mod-tidy:
 	go mod tidy
+
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 clean:
 	rm -f $(BINARY) coverage.out
