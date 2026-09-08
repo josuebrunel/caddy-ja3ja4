@@ -3,6 +3,7 @@ package ja3ja4
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -147,6 +148,56 @@ func TestJA3Extensions_SortedOutput(t *testing.T) {
 	if got != "0-5-16" {
 		t.Errorf("expected sorted extensions '0-5-16', got %q", got)
 	}
+}
+
+// uint16sFromBytes decodes a byte slice into big-endian uint16 values,
+// discarding a trailing odd byte. Used to turn fuzzer-provided []byte input
+// into the uint16 slices tls.ClientHelloInfo actually uses.
+func uint16sFromBytes(b []byte) []uint16 {
+	n := len(b) / 2
+	out := make([]uint16, n)
+	for i := 0; i < n; i++ {
+		out[i] = binary.BigEndian.Uint16(b[i*2 : i*2+2])
+	}
+	return out
+}
+
+// FuzzComputeJA3 exercises computeJA3/computeFingerprints with arbitrary
+// ClientHello-shaped data, since these fields (cipher suites, extensions,
+// curves, point formats) come directly from an attacker-controlled TLS
+// handshake. It only asserts the function never panics and always returns a
+// well-formed 5-field JA3 string; it makes no claim about specific values.
+func FuzzComputeJA3(f *testing.F) {
+	f.Add(uint16(tls.VersionTLS12), []byte{0xc0, 0x2b, 0xc0, 0x2f}, []byte{0x00, 0x00, 0x00, 0x05}, []byte{0x00, 0x17}, []byte{0, 1}, false)
+	f.Add(uint16(tls.VersionTLS13), []byte{0x13, 0x01, 0x13, 0x02, 0x13, 0x03}, []byte{0xff, 0x01, 0x00, 0x2b}, []byte{0x00, 0x1d}, []byte{0}, true)
+	f.Add(uint16(0), []byte{}, []byte{}, []byte{}, []byte{}, false)
+	f.Add(uint16(0x0a0a), []byte{0x0a, 0x0a, 0x1a, 0x1a}, []byte{0x2a, 0x2a}, []byte{0xfa, 0xfa}, []byte{0}, true)
+
+	f.Fuzz(func(t *testing.T, version uint16, ciphersRaw, extsRaw, curvesRaw, points []byte, sortExts bool) {
+		curveIDs := uint16sFromBytes(curvesRaw)
+		curves := make([]tls.CurveID, len(curveIDs))
+		for i, c := range curveIDs {
+			curves[i] = tls.CurveID(c)
+		}
+
+		chi := &tls.ClientHelloInfo{
+			SupportedVersions: []uint16{version},
+			CipherSuites:      uint16sFromBytes(ciphersRaw),
+			Extensions:        uint16sFromBytes(extsRaw),
+			SupportedCurves:   curves,
+			SupportedPoints:   points,
+		}
+
+		raw, hash := computeJA3(chi, sortExts)
+		if strings.Count(raw, ",") != 4 {
+			t.Fatalf("malformed JA3 raw string, want 4 commas (5 fields): %q", raw)
+		}
+		if hash != "" && len(hash) != 32 {
+			t.Fatalf("malformed JA3 MD5 hash, want 32 hex chars: %q", hash)
+		}
+
+		computeFingerprints(chi, sortExts)
+	})
 }
 
 func TestComputeJA4_NilInput(t *testing.T) {
