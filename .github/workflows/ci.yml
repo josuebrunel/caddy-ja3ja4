@@ -26,6 +26,9 @@ jobs:
           go-version: ${{ matrix.go }}
           cache: true
 
+      - name: Check go.mod is tidy
+        run: make mod-check
+
       - name: Generate test certificates
         run: make generate-certs
 

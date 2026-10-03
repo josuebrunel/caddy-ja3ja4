@@ -2,11 +2,6 @@ version: 2
 
 project_name: caddy-ja3ja4
 
-before:
-  hooks:
-    - go mod tidy
-    - go generate ./...
-
 builds:
   - id: caddy-ja3ja4
     main: ./cmd/caddy
@@ -40,11 +35,10 @@ builds:
       - nobadger
       - nomysql
       - nopgx
-      - caddy
 
 archives:
   - id: caddy-ja3ja4
-    format: tar.gz
+    formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_
       {{- title .Os }}_
@@ -54,7 +48,7 @@ archives:
       {{- else }}{{ .Arch }}{{ end }}
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
     files:
       - LICENSE
       - README.md

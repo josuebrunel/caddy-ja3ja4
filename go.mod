@@ -5,6 +5,7 @@ go 1.25.1
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/exaring/ja4plus v0.0.3
+	github.com/quic-go/quic-go v0.59.1
 	go.uber.org/zap v1.28.0
 )
 
@@ -90,7 +91,6 @@ require (
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect

@@ -1,10 +1,10 @@
-.PHONY: build test test-race test-coverage bench fuzz lint vet fmt mod-tidy vulncheck clean xcaddy generate-certs docker-build docker-up docker-down
+.PHONY: build test test-race test-coverage bench fuzz lint vet fmt mod-tidy mod-check vulncheck clean xcaddy generate-certs docker-build docker-up docker-down
 
 BINARY := caddy
 MODULE := github.com/josuebrunel/caddy-ja3ja4
 
 build:
-	go build -tags caddy -o $(BINARY) ./cmd/caddy
+	go build -o $(BINARY) ./cmd/caddy
 
 test:
 	go test -v -short ./...
@@ -34,6 +34,11 @@ fmt:
 
 mod-tidy:
 	go mod tidy
+
+# Fails when go.mod/go.sum are not what `go mod tidy` would write (used by CI).
+mod-check:
+	go mod tidy
+	git diff --exit-code -- go.mod go.sum
 
 vulncheck:
 	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
