@@ -251,9 +251,7 @@ func TestFingerprintStore_LoadRefreshesLastSeen(t *testing.T) {
 	// Simulate the entry aging past what a short TTL would allow, then
 	// "use" it via Load before sweeping with that TTL. It must survive.
 	key := connKey(conn)
-	s.mu.RLock()
-	e := s.m[key]
-	s.mu.RUnlock()
+	e := entryFor(s, key)
 	e.lastSeen.Store(time.Now().Add(-time.Hour).UnixNano())
 
 	if _, ok := s.Load(conn); !ok {
@@ -273,9 +271,7 @@ func TestFingerprintStore_StartSweeperStopsOnContextDone(t *testing.T) {
 	s.Store(conn, TLSFingerprint{JA3: "abc"})
 
 	key := connKey(conn)
-	s.mu.RLock()
-	e := s.m[key]
-	s.mu.RUnlock()
+	e := entryFor(s, key)
 	e.lastSeen.Store(0) // already stale
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -981,9 +977,7 @@ func TestConnStateFunc_IdleRestartsTheTTLClock(t *testing.T) {
 	t.Cleanup(func() { store.Delete(conn) })
 
 	age := func(d time.Duration) {
-		store.mu.RLock()
-		defer store.mu.RUnlock()
-		store.m[connKey(conn)].lastSeen.Store(time.Now().Add(-d).UnixNano())
+		entryFor(store, connKey(conn)).lastSeen.Store(time.Now().Add(-d).UnixNano())
 	}
 
 	age(2 * time.Hour) // the request has been running for two hours
@@ -1079,4 +1073,78 @@ func sweepRefs() int {
 	store.sweepMu.Lock()
 	defer store.sweepMu.Unlock()
 	return store.sweepRefs
+}
+
+// entryFor returns the raw entry stored under key, for tests that need to age it.
+func entryFor(s *FingerprintStore, key string) *fingerprintEntry {
+	sh := s.shard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	return sh.m[key]
+}
+
+// While one shard is locked (as it is during its slice of a sweep), the other
+// shards must stay fully usable.
+func TestFingerprintStore_SweepOnlyBlocksOneShard(t *testing.T) {
+	s := NewFingerprintStore()
+
+	// Find two keys that live in different shards.
+	keyA := "10.0.0.1:1000"
+	shardA := s.shard(keyA)
+	var keyB string
+	for port := 1001; ; port++ {
+		keyB = fmt.Sprintf("10.0.0.1:%d", port)
+		if s.shard(keyB) != shardA {
+			break
+		}
+	}
+
+	shardA.mu.Lock() // pretend the sweeper is working through shard A
+	defer shardA.mu.Unlock()
+
+	done := make(chan bool)
+	go func() {
+		conn := &mockConn{remoteAddr: &mockAddr{s: keyB}}
+		ok := s.Store(conn, TLSFingerprint{JA3: "b"})
+		_, loaded := s.Load(conn)
+		done <- ok && loaded
+	}()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Error("Store/Load on an unlocked shard failed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Store/Load on another shard blocked while one shard was locked")
+	}
+}
+
+func TestFingerprintStore_LenTracksStoreDeleteAndSweep(t *testing.T) {
+	s := NewFingerprintStore()
+	conns := make([]*mockConn, 200) // spread over several shards
+	for i := range conns {
+		conns[i] = &mockConn{remoteAddr: &mockAddr{s: fmt.Sprintf("10.1.%d.%d:4000", i/250, i%250)}}
+		s.Store(conns[i], TLSFingerprint{JA3: "x"})
+	}
+	if s.Len() != 200 {
+		t.Fatalf("Len = %d, want 200", s.Len())
+	}
+
+	s.Store(conns[0], TLSFingerprint{JA3: "again"}) // replacing must not double count
+	if s.Len() != 200 {
+		t.Errorf("Len after replace = %d, want 200", s.Len())
+	}
+
+	for _, c := range conns[:50] {
+		s.Delete(c)
+		s.Delete(c) // deleting twice must not double decrement
+	}
+	if s.Len() != 150 {
+		t.Errorf("Len after deletes = %d, want 150", s.Len())
+	}
+
+	s.sweep(0)
+	if s.Len() != 0 {
+		t.Errorf("Len after sweeping everything = %d, want 0", s.Len())
+	}
 }

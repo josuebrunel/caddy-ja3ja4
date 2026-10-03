@@ -302,11 +302,7 @@ func TestE2E_FingerprintRemovedAfterBareHandshake(t *testing.T) {
 	waitForEmptyStore(t)
 }
 
-func storeLen() int {
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	return len(store.m)
-}
+func storeLen() int { return store.Len() }
 
 // A resumed TLS session skips certificate selection, so the fingerprint has to
 // be captured on every ClientHello, not only during GetCertificate.

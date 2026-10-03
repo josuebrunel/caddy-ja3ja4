@@ -41,12 +41,23 @@ type fingerprintEntry struct {
 	lastSeen atomic.Int64
 }
 
+// shardCount is the number of independently locked partitions of the store.
+// Handshakes, lookups and the sweeper then contend per shard instead of on one
+// global lock, and a sweep only ever blocks 1/shardCount of the keys at a time.
+const shardCount = 32
+
+// storeShard is one lock-protected partition of the store.
+type storeShard struct {
+	mu sync.RWMutex
+	m  map[string]*fingerprintEntry
+}
+
 // FingerprintStore is a thread-safe store for TLS fingerprints keyed by connection.
 type FingerprintStore struct {
-	mu  sync.RWMutex
-	m   map[string]*fingerprintEntry
-	max int
-	ttl atomic.Int64 // time.Duration; see EnsureTTL
+	shards [shardCount]storeShard
+	size   atomic.Int64 // entries across all shards, enforced against max
+	max    int
+	ttl    atomic.Int64 // time.Duration; see EnsureTTL
 
 	sweepMu     sync.Mutex
 	sweepRefs   int
@@ -56,12 +67,27 @@ type FingerprintStore struct {
 
 // NewFingerprintStore creates a new fingerprint store.
 func NewFingerprintStore() *FingerprintStore {
-	s := &FingerprintStore{
-		m:   make(map[string]*fingerprintEntry),
-		max: defaultMaxEntries,
+	s := &FingerprintStore{max: defaultMaxEntries}
+	for i := range s.shards {
+		s.shards[i].m = make(map[string]*fingerprintEntry)
 	}
 	s.ttl.Store(int64(ttlForIdleTimeout(0)))
 	return s
+}
+
+// shard returns the partition responsible for key (FNV-1a, allocation-free).
+func (s *FingerprintStore) shard(key string) *storeShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return &s.shards[h%shardCount]
+}
+
+// Len returns the number of stored fingerprints.
+func (s *FingerprintStore) Len() int {
+	return int(s.size.Load())
 }
 
 // ttlForIdleTimeout returns how long an unused fingerprint entry may live for a
@@ -111,12 +137,19 @@ func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 	e := &fingerprintEntry{fp: fp}
 	e.lastSeen.Store(time.Now().UnixNano())
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.m[key]; !exists && len(s.m) >= s.max {
-		return false
+	sh := s.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, exists := sh.m[key]; !exists {
+		// The cap is checked against the store-wide count, so it can be
+		// overshot by a few entries when shards race; it is a safety bound,
+		// not an exact quota.
+		if s.size.Load() >= int64(s.max) {
+			return false
+		}
+		s.size.Add(1)
 	}
-	s.m[key] = e
+	sh.m[key] = e
 	return true
 }
 
@@ -132,9 +165,10 @@ func (s *FingerprintStore) LoadByRemoteAddr(remoteAddr string) (TLSFingerprint, 
 		return TLSFingerprint{}, false
 	}
 
-	s.mu.RLock()
-	e, ok := s.m[remoteAddr]
-	s.mu.RUnlock()
+	sh := s.shard(remoteAddr)
+	sh.mu.RLock()
+	e, ok := sh.m[remoteAddr]
+	sh.mu.RUnlock()
 	if !ok {
 		return TLSFingerprint{}, false
 	}
@@ -149,23 +183,34 @@ func (s *FingerprintStore) Delete(conn net.Conn) {
 	if key == "" {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.m, key)
+	sh := s.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, ok := sh.m[key]; ok {
+		delete(sh.m, key)
+		s.size.Add(-1)
+	}
 }
 
 // sweep removes entries that have not been touched (via Store or a Load hit)
 // within ttl. Long-lived, actively-used connections never expire since every
 // lookup refreshes lastSeen; only idle or closed connections' entries age out.
+// It locks one shard at a time.
 func (s *FingerprintStore) sweep(ttl time.Duration) {
 	cutoff := time.Now().Add(-ttl).UnixNano()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key, e := range s.m {
-		if e.lastSeen.Load() < cutoff {
-			delete(s.m, key)
+	// One shard at a time, so handshakes and lookups on the other shards are
+	// never held up by a sweep, however large the store has grown.
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for key, e := range sh.m {
+			if e.lastSeen.Load() < cutoff {
+				delete(sh.m, key)
+				s.size.Add(-1)
+			}
 		}
+		sh.mu.Unlock()
 	}
 }
 
