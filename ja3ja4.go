@@ -112,7 +112,7 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 		return nil
 	}
 
-	if err := installMatcher(srv.TLSConnPolicies, m.SortJA3Extensions, m.logger); err != nil {
+	if err := installMatcher(srv.TLSConnPolicies, m.logger); err != nil {
 		return err
 	}
 
@@ -133,40 +133,29 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 // the handshake context hook it runs for every ClientHello, including TLS 1.3
 // resumptions that never select a certificate.
 //
-// The first handler to provision on a server wins: an existing matcher is never
-// replaced. Handlers cannot be tied to individual policies (a policy is picked
-// by SNI before any route runs), so the sort setting is effectively
-// server-wide, and a later handler asking for a different one gets a warning.
-// {tls.ja3_sorted} always reports what was really used.
-func installMatcher(policies caddytls.ConnectionPolicies, sortExtensions bool, logger *zap.Logger) error {
+// It is installed in every policy of the server, because a policy is picked
+// from the ClientHello before any route runs, so handlers can't be tied to
+// individual policies. That is fine: the matcher always records the unsorted
+// fingerprint, and each handler derives its own sorted variant from it, so
+// sort_ja3_extensions is a per-handler setting. An existing matcher is left
+// alone.
+func installMatcher(policies caddytls.ConnectionPolicies, logger *zap.Logger) error {
 	if len(policies) == 0 {
 		logger.Warn("this server has no TLS connection policies (plain HTTP?); " +
 			"ja3_ja4 has no handshake to fingerprint, so {tls.ja3} and {tls.ja4} will be empty")
 		return nil
 	}
 
-	matcherJSON, err := json.Marshal(HandshakeMatcher{SortJA3Extensions: sortExtensions})
+	matcherJSON, err := json.Marshal(HandshakeMatcher{})
 	if err != nil {
 		return err
 	}
-
 	for _, cp := range policies {
 		if cp.MatchersRaw == nil {
 			cp.MatchersRaw = make(caddy.ModuleMap)
 		}
-		existing, exists := cp.MatchersRaw[matcherName]
-		if !exists {
+		if _, exists := cp.MatchersRaw[matcherName]; !exists {
 			cp.MatchersRaw[matcherName] = matcherJSON
-			continue
-		}
-
-		var installed HandshakeMatcher
-		if err := json.Unmarshal(existing, &installed); err == nil && installed.SortJA3Extensions != sortExtensions {
-			logger.Warn("another ja3_ja4 handler on this server already set sort_ja3_extensions differently; "+
-				"the first one wins for every site on the server, {tls.ja3_sorted} reports what is actually used",
-				zap.Bool("in_effect", installed.SortJA3Extensions),
-				zap.Bool("ignored", sortExtensions))
-			return nil // identical for every remaining policy
 		}
 	}
 	return nil

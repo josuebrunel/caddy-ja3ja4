@@ -59,7 +59,12 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	// plain HTTP, gets empty values instead.
 	sorted := ""
 	if found {
-		sorted = strconv.FormatBool(fp.Sorted)
+		// The store holds the wire-order fingerprint; this handler's own
+		// sort_ja3_extensions decides which variant it reports.
+		if m.SortJA3Extensions {
+			fp = fp.WithSortedJA3()
+		}
+		sorted = strconv.FormatBool(m.SortJA3Extensions)
 	}
 	rp.Set("tls.ja3", fp.JA3)
 	rp.Set("tls.ja4", fp.JA4)

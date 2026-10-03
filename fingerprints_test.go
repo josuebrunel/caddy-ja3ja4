@@ -2,8 +2,10 @@ package ja3ja4
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	mrand "math/rand"
@@ -181,6 +183,14 @@ func FuzzComputeJA3(f *testing.F) {
 		wantRaw, wantHash := referenceJA3(chi, sortExts)
 		if raw != wantRaw || hash != wantHash {
 			t.Fatalf("JA3 differs from the reference:\n got  %q %s\n want %q %s", raw, hash, wantRaw, wantHash)
+		}
+
+		// The sorted variant derived from the unsorted raw string must match too.
+		rawU, hashU, ja4 := computeFingerprints(chi, false)
+		derived := TLSFingerprint{JA3: hashU, JA3Raw: rawU, JA4: ja4}.WithSortedJA3()
+		sortedRaw, sortedHash := referenceJA3(chi, true)
+		if derived.JA3Raw != sortedRaw || derived.JA3 != sortedHash {
+			t.Fatalf("derived sorted JA3 differs from the reference:\n got  %q\n want %q", derived.JA3Raw, sortedRaw)
 		}
 	})
 }
@@ -789,137 +799,197 @@ func TestServeHTTP_NoFingerprint_PlaceholdersAreEmpty(t *testing.T) {
 	}
 }
 
-// {tls.ja3_sorted} must describe how the stored hash was computed, not the
-// config of whichever handler happens to serve the request.
-func TestServeHTTP_ReportsSortedFromFingerprint(t *testing.T) {
+// Each handler reports its own sort_ja3_extensions: the store holds the
+// wire-order fingerprint and a sorting handler derives its variant from it.
+func TestServeHTTP_EachHandlerChoosesItsOwnSorting(t *testing.T) {
 	resetStore(t)
+	conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.50:7000"}}
+	chi := &tls.ClientHelloInfo{
+		Conn:              conn,
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1302, 0x1301},
+		Extensions:        []uint16{16, 0, 43, 5},
+		SupportedCurves:   []tls.CurveID{29, 23},
+		SupportedPoints:   []uint8{1, 0},
+	}
+	(&HandshakeMatcher{}).Match(chi)
+	wantUnsortedRaw, wantUnsortedHash := referenceJA3(chi, false)
+	wantSortedRaw, wantSortedHash := referenceJA3(chi, true)
+	if wantUnsortedRaw == wantSortedRaw {
+		t.Fatal("test setup: sorting must change this hello")
+	}
+
 	for _, tc := range []struct {
-		name        string
-		fpSorted    bool
-		handlerSort bool
-		want        string
+		name                     string
+		sort                     bool
+		wantRaw, wantJA3, wantFl string
 	}{
-		{"hash sorted, handler unsorted", true, false, "true"},
-		{"hash unsorted, handler sorted", false, true, "false"},
+		{"handler without sorting", false, wantUnsortedRaw, wantUnsortedHash, "false"},
+		{"handler with sorting", true, wantSortedRaw, wantSortedHash, "true"},
+		{"handler without sorting again", false, wantUnsortedRaw, wantUnsortedHash, "false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.50:7000"}}
-			store.Store(conn, TLSFingerprint{JA3: "abc", JA4: "def", JA3Raw: "raw", Sorted: tc.fpSorted})
-			t.Cleanup(func() { store.Delete(conn) })
-
 			repl := caddy.NewReplacer()
 			ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
 			ctx = context.WithValue(ctx, connCtxKey{}, net.Conn(conn))
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
 
 			next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
-			m := &JA3JA4{SortJA3Extensions: tc.handlerSort}
-			if err := m.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+			if err := (&JA3JA4{SortJA3Extensions: tc.sort}).ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
 				t.Fatal(err)
 			}
-			if got := repl.ReplaceAll("{tls.ja3_sorted}", ""); got != tc.want {
-				t.Errorf("{tls.ja3_sorted} = %q, want %q", got, tc.want)
+			for key, want := range map[string]string{
+				"tls.ja3": tc.wantJA3, "tls.ja3_raw": tc.wantRaw, "tls.ja3_sorted": tc.wantFl,
+			} {
+				if got := repl.ReplaceAll("{"+key+"}", ""); got != want {
+					t.Errorf("{%s} = %q, want %q", key, got, want)
+				}
 			}
 		})
 	}
 }
 
-func TestHandshakeMatcher_RecordsSortedFlag(t *testing.T) {
-	resetStore(t)
-	for _, sorted := range []bool{false, true} {
-		conn := &mockConn{remoteAddr: &mockAddr{s: fmt.Sprintf("192.0.2.60:%d", 8000+btoi(sorted))}}
-		t.Cleanup(func() { store.Delete(conn) })
-		(&HandshakeMatcher{SortJA3Extensions: sorted}).Match(&tls.ClientHelloInfo{
-			Conn:              conn,
-			SupportedVersions: []uint16{tls.VersionTLS13},
-			Extensions:        []uint16{16, 0},
-		})
-		if fp, ok := store.Load(conn); !ok || fp.Sorted != sorted {
-			t.Errorf("sorted=%v: stored fingerprint has Sorted=%v (found=%v)", sorted, fp.Sorted, ok)
+// Only the JA3 changes with sorting; the JA4 is the same either way.
+func TestWithSortedJA3_LeavesJA4Alone(t *testing.T) {
+	fp := TLSFingerprint{JA3: "h", JA3Raw: "771,1-2,16-0,29-23,1-0", JA4: "t13d0000h1_a_b"}
+	got := fp.WithSortedJA3()
+	if got.JA4 != fp.JA4 {
+		t.Errorf("JA4 changed: %q", got.JA4)
+	}
+	if got.JA3Raw != "771,1-2,0-16,23-29,0-1" {
+		t.Errorf("sorted raw = %q", got.JA3Raw)
+	}
+	if fp.JA3Raw != "771,1-2,16-0,29-23,1-0" {
+		t.Error("WithSortedJA3 must not modify the receiver")
+	}
+}
+
+// The sorted variant derived from the raw string must equal what the straight
+// computation from the ClientHello gives, for any hello.
+func TestWithSortedJA3_MatchesReferenceOnRandomHellos(t *testing.T) {
+	rng := mrand.New(mrand.NewSource(7))
+	pick := func(n int) []uint16 {
+		out := make([]uint16, n)
+		for i := range out {
+			out[i] = uint16(rng.Intn(70000))
+			if rng.Intn(4) == 0 {
+				g := uint16(rng.Intn(16))<<4 | 0x0a
+				out[i] = g<<8 | g
+			}
+		}
+		return out
+	}
+	for i := 0; i < 3000; i++ {
+		chi := &tls.ClientHelloInfo{
+			SupportedVersions: pick(rng.Intn(4)),
+			CipherSuites:      pick(rng.Intn(90)),
+			Extensions:        pick(rng.Intn(90)),
+			SupportedPoints:   pick8(rng, rng.Intn(5)),
+		}
+		for _, c := range pick(rng.Intn(80)) {
+			chi.SupportedCurves = append(chi.SupportedCurves, tls.CurveID(c))
+		}
+
+		rawU, hashU, ja4 := computeFingerprints(chi, false)
+		got := TLSFingerprint{JA3: hashU, JA3Raw: rawU, JA4: ja4}.WithSortedJA3()
+		wantRaw, wantHash := referenceJA3(chi, true)
+		if got.JA3Raw != wantRaw || got.JA3 != wantHash {
+			t.Fatalf("case %d differs:\n got  %q\n want %q", i, got.JA3Raw, wantRaw)
 		}
 	}
 }
 
-func btoi(b bool) int {
-	if b {
-		return 1
+func TestSortJA3_MalformedInputIsLeftAlone(t *testing.T) {
+	for _, raw := range []string{"", "not,enough,fields", "771,1,2-x-3,4,5", "771,1,2,3,4,5,6"} {
+		got, hash := sortJA3(raw)
+		sum := md5.Sum([]byte(raw))
+		if got != raw || hash != hex.EncodeToString(sum[:]) {
+			t.Errorf("sortJA3(%q) = %q, %s; want it unchanged with its own hash", raw, got, hash)
+		}
 	}
-	return 0
+}
+
+// The derived variant is computed once per connection and cached on its entry.
+func TestWithSortedJA3_IsCachedOnTheEntry(t *testing.T) {
+	s := NewFingerprintStore()
+	conn := tcpAddrConn(1)
+	s.Store(conn, TLSFingerprint{JA3: "h", JA3Raw: "771,1,16-0,29-23,1-0", JA4: "j"})
+
+	fp, _ := s.Load(conn)
+	if entryFor(s, connKey(conn)).sorted.Load() != nil {
+		t.Fatal("the sorted variant must not be built until somebody asks for it")
+	}
+	first := fp.WithSortedJA3()
+	cached := entryFor(s, connKey(conn)).sorted.Load()
+	if cached == nil || cached.raw != first.JA3Raw {
+		t.Fatal("the sorted variant was not cached on the entry")
+	}
+
+	fp2, _ := s.Load(conn)
+	second := fp2.WithSortedJA3()
+	if entryFor(s, connKey(conn)).sorted.Load() != cached || second != first {
+		t.Error("a second request must reuse the cached variant")
+	}
+}
+
+func TestHandshakeMatcher_AlwaysRecordsTheUnsortedVariant(t *testing.T) {
+	resetStore(t)
+	for i, sorted := range []bool{false, true} { // the deprecated field must make no difference
+		conn := &mockConn{remoteAddr: &mockAddr{s: fmt.Sprintf("192.0.2.60:%d", 8000+i)}}
+		chi := &tls.ClientHelloInfo{
+			Conn:              conn,
+			SupportedVersions: []uint16{tls.VersionTLS13},
+			Extensions:        []uint16{16, 0},
+		}
+		(&HandshakeMatcher{SortJA3Extensions: sorted}).Match(chi)
+		want, _ := referenceJA3(chi, false)
+		if fp, ok := store.Load(conn); !ok || fp.JA3Raw != want {
+			t.Errorf("sorted=%v: stored %q (found=%v), want the wire-order %q", sorted, fp.JA3Raw, ok, want)
+		}
+	}
 }
 
 func TestInstallMatcher(t *testing.T) {
 	newPolicies := func() caddytls.ConnectionPolicies {
 		return caddytls.ConnectionPolicies{{}, {}}
 	}
-	sortOf := func(t *testing.T, cp *caddytls.ConnectionPolicy) bool {
-		t.Helper()
-		var m HandshakeMatcher
-		if err := json.Unmarshal(cp.MatchersRaw[matcherName], &m); err != nil {
-			t.Fatal(err)
-		}
-		return m.SortJA3Extensions
-	}
 
 	t.Run("installs in every policy", func(t *testing.T) {
 		cps := newPolicies()
-		if err := installMatcher(cps, true, zap.NewNop()); err != nil {
+		if err := installMatcher(cps, zap.NewNop()); err != nil {
 			t.Fatal(err)
 		}
 		for i, cp := range cps {
-			if _, ok := cp.MatchersRaw[matcherName]; !ok || !sortOf(t, cp) {
-				t.Errorf("policy %d: matcher missing or not sorted", i)
+			if _, ok := cp.MatchersRaw[matcherName]; !ok {
+				t.Errorf("policy %d: matcher missing", i)
 			}
 		}
 	})
 
-	t.Run("keeps other matchers", func(t *testing.T) {
+	t.Run("keeps other matchers and is idempotent", func(t *testing.T) {
 		cps := newPolicies()
 		cps[0].MatchersRaw = caddy.ModuleMap{"sni": json.RawMessage(`["example.com"]`)}
-		if err := installMatcher(cps, false, zap.NewNop()); err != nil {
-			t.Fatal(err)
+		core, logs := observer.New(zap.WarnLevel)
+		for i := 0; i < 3; i++ { // several handlers on one server
+			if err := installMatcher(cps, zap.New(core)); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if string(cps[0].MatchersRaw["sni"]) != `["example.com"]` {
 			t.Error("existing matcher was modified")
 		}
-	})
-
-	t.Run("first handler wins and a conflict is logged", func(t *testing.T) {
-		cps := newPolicies()
-		core, logs := observer.New(zap.WarnLevel)
-
-		if err := installMatcher(cps, false, zap.New(core)); err != nil {
-			t.Fatal(err)
-		}
-		if err := installMatcher(cps, true, zap.New(core)); err != nil {
-			t.Fatal(err)
-		}
-		for i, cp := range cps {
-			if sortOf(t, cp) {
-				t.Errorf("policy %d: the later handler replaced the first one's setting", i)
-			}
-		}
-		if logs.Len() != 1 {
-			t.Errorf("expected exactly one warning for the conflict, got %d", logs.Len())
+		if logs.Len() != 0 {
+			t.Errorf("handlers with different sort settings must not conflict any more: %v", logs.All())
 		}
 	})
 
 	t.Run("warns when the server has no TLS policies", func(t *testing.T) {
 		core, logs := observer.New(zap.WarnLevel)
-		if err := installMatcher(nil, false, zap.New(core)); err != nil {
+		if err := installMatcher(nil, zap.New(core)); err != nil {
 			t.Fatal(err)
 		}
 		if logs.Len() != 1 {
 			t.Errorf("expected one warning for a server without TLS, got %d", logs.Len())
-		}
-	})
-
-	t.Run("same setting is silent", func(t *testing.T) {
-		cps := newPolicies()
-		core, logs := observer.New(zap.WarnLevel)
-		_ = installMatcher(cps, true, zap.New(core))
-		_ = installMatcher(cps, true, zap.New(core))
-		if logs.Len() != 0 {
-			t.Errorf("unexpected warning: %v", logs.All())
 		}
 	})
 }

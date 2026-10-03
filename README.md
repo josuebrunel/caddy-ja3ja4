@@ -64,7 +64,7 @@ Fingerprints are recorded for every TLS connection on a Caddy server, i.e. all s
 
 #### `sort_ja3_extensions`
 
-When enabled, TLS extensions are sorted by ID before JA3 computation. This normalizes fingerprints across clients that randomize extension order.
+When enabled, TLS extensions, curves and point formats are sorted by ID in the JA3 this handler reports. This normalizes fingerprints across clients that randomize extension order. The setting is per `ja3_ja4` handler, so sites on the same server can differ; `{tls.ja3_sorted}` tells you which variant a request got. (The `sort_ja3_extensions` field of the `tls.handshake_match.ja3ja4` and `tls.context.ja3ja4` modules is deprecated and ignored.)
 
 ```caddyfile
 example.com {
@@ -276,7 +276,7 @@ The fingerprints reach the log through `log_append` lines in `Caddyfile.test`, a
 
 1. **Provision Phase**: When a `ja3_ja4` handler is provisioned, it:
    - Gets the current `*caddyhttp.Server` from context
-   - Adds a `tls.handshake_match.ja3ja4` matcher to every TLS connection policy of that server (the first handler's `sort_ja3_extensions` wins, see below)
+   - Adds a `tls.handshake_match.ja3ja4` matcher to every TLS connection policy of that server (it always records the wire-order fingerprint; see `sort_ja3_extensions`)
    - Registers `ConnContext` and `ConnState` callbacks, once per server
    - Joins the shared background sweeper and sizes the store TTL from the server's idle timeout
 
@@ -303,7 +303,7 @@ The fingerprints reach the log through `log_append` lines in `Caddyfile.test`, a
 
 ### Fingerprinting is per server
 
-The matcher is installed in every TLS connection policy of a Caddy server, i.e. every site sharing a listening port, as soon as one of them uses `ja3_ja4`. Handlers can't be tied to individual policies, because a policy is chosen from the ClientHello before any route runs. So `sort_ja3_extensions` is effectively server-wide: the first handler's setting wins and a later handler asking for something different logs a warning. `{tls.ja3_sorted}` always reports what was actually used.
+The matcher is installed in every TLS connection policy of a Caddy server, i.e. every site sharing a listening port, as soon as one of them uses `ja3_ja4`. Handlers can't be tied to individual policies, because a policy is chosen from the ClientHello before any route runs. So every handshake on that server is fingerprinted, including those of sites that don't use `ja3_ja4` (about 4 microseconds each). `sort_ja3_extensions` is not affected: it is a per-handler setting, because the store keeps the wire-order fingerprint and a handler that sorts derives its variant from it.
 
 ### HTTP/3 entries age out instead of being deleted
 

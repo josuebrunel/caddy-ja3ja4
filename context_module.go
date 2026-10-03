@@ -31,6 +31,12 @@ func init() {
 // The matcher has no effect on policy selection. Caddy may call it once per
 // policy it tries for a handshake; every call records the same value.
 type HandshakeMatcher struct {
+	// SortJA3Extensions is ignored. The matcher always records the unsorted
+	// fingerprint and each ja3_ja4 handler derives its own sorted variant, so
+	// the setting is per handler. The field is kept so existing JSON configs
+	// still load.
+	//
+	// Deprecated: set sort_ja3_extensions on the ja3_ja4 handler instead.
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
 	logger *zap.Logger
@@ -52,20 +58,21 @@ func (m *HandshakeMatcher) Provision(ctx caddy.Context) error {
 
 // Match records the fingerprint of hello and reports true.
 func (m *HandshakeMatcher) Match(hello *tls.ClientHelloInfo) bool {
-	recordFingerprint(hello, m.SortJA3Extensions, m.logger)
+	recordFingerprint(hello, m.logger)
 	return true
 }
 
 // recordFingerprint computes the fingerprints for hello and stores them in the
 // global store, keyed by the connection. It returns the fingerprint and whether
 // one was computed (false when hello or its connection is missing).
-func recordFingerprint(hello *tls.ClientHelloInfo, sortExtensions bool, logger *zap.Logger) (TLSFingerprint, bool) {
+func recordFingerprint(hello *tls.ClientHelloInfo, logger *zap.Logger) (TLSFingerprint, bool) {
 	if hello == nil || hello.Conn == nil {
 		return TLSFingerprint{}, false
 	}
 
-	ja3Raw, ja3, ja4 := computeFingerprints(hello, sortExtensions)
-	fp := TLSFingerprint{JA3: ja3, JA3Raw: ja3Raw, JA4: ja4, Sorted: sortExtensions}
+	// Always the unsorted variant: handlers that sort derive it from this.
+	ja3Raw, ja3, ja4 := computeFingerprints(hello, false)
+	fp := TLSFingerprint{JA3: ja3, JA3Raw: ja3Raw, JA4: ja4}
 
 	if !store.Store(hello.Conn, fp) {
 		warnStoreFull(logger, transportOf(hello.Conn.RemoteAddr()))
@@ -81,6 +88,9 @@ func recordFingerprint(hello *tls.ClientHelloInfo, sortExtensions bool, logger *
 // registered so existing JSON configs that reference tls.context.ja3ja4 keep
 // working.
 type HandshakeContextModule struct {
+	// SortJA3Extensions is ignored; see HandshakeMatcher.SortJA3Extensions.
+	//
+	// Deprecated: set sort_ja3_extensions on the ja3_ja4 handler instead.
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
 	logger *zap.Logger
@@ -126,7 +136,7 @@ func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (c
 	if hello == nil {
 		return context.Background(), nil
 	}
-	recordFingerprint(hello, m.SortJA3Extensions, m.logger)
+	recordFingerprint(hello, m.logger)
 	return hello.Context(), nil
 }
 

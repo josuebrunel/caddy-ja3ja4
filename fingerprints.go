@@ -49,6 +49,15 @@ type fingerprintEntry struct {
 	// read is set once a request has looked the entry up. Unread QUIC entries
 	// expire after unreadQUICTTL instead of the full TTL.
 	read atomic.Bool
+	// sorted caches the sorted JA3 variant (see TLSFingerprint.WithSortedJA3),
+	// built the first time a handler that sorts asks for it.
+	sorted atomic.Pointer[sortedJA3]
+}
+
+// sortedJA3 is a JA3 string and hash computed with extensions, curves and point
+// formats sorted.
+type sortedJA3 struct {
+	raw, hash string
 }
 
 // shardCount is the number of independently locked partitions of the store.
@@ -250,7 +259,9 @@ func (s *FingerprintStore) load(key []byte) (TLSFingerprint, bool) {
 	}
 	e.lastSeen.Store(time.Now().UnixNano())
 	e.read.Store(true)
-	return e.fp, true
+	fp := e.fp
+	fp.entry = e // lets WithSortedJA3 cache its result on the entry
+	return fp, true
 }
 
 // Delete removes the fingerprint for the given connection.
@@ -424,15 +435,81 @@ func appendConnKey(dst []byte, conn net.Conn) []byte {
 // Global store for fingerprints across all connections.
 var store = NewFingerprintStore()
 
-// TLSFingerprint holds computed JA3 and JA4 fingerprint values.
+// TLSFingerprint holds computed JA3 and JA4 fingerprint values. JA3 and JA3Raw
+// are always the unsorted (wire order) variant; WithSortedJA3 derives the other.
 type TLSFingerprint struct {
 	JA3    string
 	JA3Raw string
 	JA4    string
-	// Sorted records whether the JA3 was computed with extensions, curves and
-	// point formats sorted (sort_ja3_extensions), so the value reported to
-	// requests matches how the hash was really produced.
-	Sorted bool
+
+	entry *fingerprintEntry // the store entry it came from, if any (for caching)
+}
+
+// WithSortedJA3 returns the fingerprint with JA3 and JA3Raw replaced by the
+// variant where extensions, curves and point formats are sorted by numeric ID
+// (the sort_ja3_extensions option). JA4 is unchanged.
+//
+// The sorted variant is derived from the raw string rather than recomputed
+// from the ClientHello: sorting only reorders fields 3 to 5 (ciphers are never
+// sorted, and GREASE is already gone), so the handshake path never has to
+// compute or store two variants, and each handler can choose its own.
+func (f TLSFingerprint) WithSortedJA3() TLSFingerprint {
+	var v *sortedJA3
+	if f.entry != nil {
+		v = f.entry.sorted.Load()
+	}
+	if v == nil {
+		raw, hash := sortJA3(f.JA3Raw)
+		v = &sortedJA3{raw: raw, hash: hash}
+		if f.entry != nil {
+			f.entry.sorted.CompareAndSwap(nil, v) // a lost race stored an identical value
+		}
+	}
+	f.JA3Raw, f.JA3 = v.raw, v.hash
+	return f
+}
+
+// sortJA3 derives the sorted JA3 string and its MD5 from an unsorted one. A
+// string that isn't a well-formed JA3 (five comma-separated fields of numbers)
+// is returned unchanged with its own hash.
+func sortJA3(raw string) (sortedRaw, hash string) {
+	fields := strings.Split(raw, ",")
+	if len(fields) == 5 {
+		var scratch [512]byte
+		out := append(scratch[:0], fields[0]...)
+		out = append(out, ',')
+		out = append(out, fields[1]...) // ciphers keep their order
+		ok := true
+		for _, f := range fields[2:] {
+			out = append(out, ',')
+			if out, ok = appendSortedIDs(out, f); !ok {
+				break
+			}
+		}
+		if ok {
+			raw = string(out)
+		}
+	}
+	sum := md5.Sum([]byte(raw))
+	return raw, hex.EncodeToString(sum[:])
+}
+
+// appendSortedIDs appends the '-'-separated numbers in field to dst in
+// ascending order. It reports false if the field has something else in it.
+func appendSortedIDs(dst []byte, field string) ([]byte, bool) {
+	if field == "" {
+		return dst, true
+	}
+	var stack [64]uint16
+	ids := stack[:0]
+	for _, part := range strings.Split(field, "-") {
+		n, err := strconv.ParseUint(part, 10, 16)
+		if err != nil {
+			return dst, false
+		}
+		ids = append(ids, uint16(n))
+	}
+	return appendJA3IDs(dst, ids, true, false), true
 }
 
 // isGREASE reports whether v is a GREASE value as defined in RFC 8701.

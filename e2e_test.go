@@ -53,6 +53,22 @@ type e2eServer struct {
 // (after the tls line); it defaults to the ja3_ja4 directive plus an echo.
 func startCaddy(t *testing.T, siteBody string, globalOpts ...string) *e2eServer {
 	t.Helper()
+	if siteBody == "" {
+		siteBody = defaultSiteBody
+	}
+	return startCaddySites(t, []string{"localhost"}, []string{siteBody}, globalOpts...)
+}
+
+const defaultSiteBody = `
+		ja3_ja4
+		header X-JA3 {tls.ja3}
+		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`
+
+// startCaddySites is startCaddy for several sites on one listener (so one Caddy
+// server). hosts[i] is the address host of site i and bodies[i] its Caddyfile
+// body. The returned server's url is that of the first site.
+func startCaddySites(t *testing.T, hosts, bodies []string, globalOpts ...string) *e2eServer {
+	t.Helper()
 
 	resetStore(t) // registered first, so it also runs after Caddy has stopped
 
@@ -64,11 +80,9 @@ func startCaddy(t *testing.T, siteBody string, globalOpts ...string) *e2eServer 
 	certPath, keyPath := writeSelfSignedCert(t, dir)
 	port := freePort(t)
 
-	if siteBody == "" {
-		siteBody = `
-		ja3_ja4
-		header X-JA3 {tls.ja3}
-		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`
+	var sites strings.Builder
+	for i := range hosts {
+		fmt.Fprintf(&sites, "%s:%d {\n\tbind 127.0.0.1\n\ttls %s %s\n\t%s\n}\n", hosts[i], port, certPath, keyPath, bodies[i])
 	}
 	caddyfile := fmt.Sprintf(`{
 	admin off
@@ -76,12 +90,7 @@ func startCaddy(t *testing.T, siteBody string, globalOpts ...string) *e2eServer 
 	skip_install_trust
 	%s
 }
-localhost:%d {
-	bind 127.0.0.1
-	tls %s %s
-	%s
-}
-`, strings.Join(globalOpts, "\n\t"), port, certPath, keyPath, siteBody)
+%s`, strings.Join(globalOpts, "\n\t"), sites.String())
 
 	adapter := caddyconfig.GetAdapter("caddyfile")
 	if adapter == nil {
@@ -100,7 +109,7 @@ localhost:%d {
 		}
 	})
 
-	return &e2eServer{port: port, url: fmt.Sprintf("https://localhost:%d/", port)}
+	return &e2eServer{port: port, url: fmt.Sprintf("https://%s:%d/", hosts[0], port)}
 }
 
 func freePort(t *testing.T) int {
@@ -171,7 +180,13 @@ func e2eClient(srv *e2eServer, tlsCfg *tls.Config) *http.Client {
 // protocol and whether the connection was reused.
 func e2eGet(t *testing.T, c *http.Client, srv *e2eServer) (fp e2eFingerprints, proto string, reused bool) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, srv.url, nil)
+	return e2eGetURL(t, c, srv.url)
+}
+
+// e2eGetURL is e2eGet for an explicit URL (to pick one of several sites).
+func e2eGetURL(t *testing.T, c *http.Client, url string) (fp e2eFingerprints, proto string, reused bool) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +195,7 @@ func e2eGet(t *testing.T, c *http.Client, srv *e2eServer) (fp e2eFingerprints, p
 	}))
 	resp, err := c.Do(req)
 	if err != nil {
-		t.Fatalf("GET %s: %v", srv.url, err)
+		t.Fatalf("GET %s: %v", url, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -756,5 +771,54 @@ func TestE2E_MaxEntriesOption(t *testing.T) {
 	}
 	if got, want := store.quicBudget(), store.max.Load()/2; got != want {
 		t.Errorf("QUIC budget = %d, want half of %d", got, store.max.Load())
+	}
+}
+
+// Two sites share one Caddy server (one listener), one sorting and one not.
+// The TLS layer is shared, so before sort_ja3_extensions was derived per
+// handler the first handler's setting won for both. Each site must now report
+// its own, and each must match the client's real ClientHello bytes.
+func TestE2E_SortSettingIsPerSiteOnASharedServer(t *testing.T) {
+	const echo = `respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`
+	srv := startCaddySites(t,
+		[]string{"localhost", "127.0.0.1"},
+		[]string{
+			"ja3_ja4\n\t" + echo, // plain
+			"ja3_ja4 {\n\t\tsort_ja3_extensions\n\t}\n\t" + echo,
+		})
+
+	for _, tc := range []struct {
+		name   string
+		url    string
+		sorted bool
+	}{
+		{"site without sorting", fmt.Sprintf("https://localhost:%d/", srv.port), false},
+		{"site with sorting", fmt.Sprintf("https://127.0.0.1:%d/", srv.port), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hello []byte
+			c := e2eClient(srv, &tls.Config{NextProtos: []string{"http/1.1"}})
+			tr := c.Transport.(*http.Transport)
+			dial := tr.DialContext
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return &recordingConn{Conn: conn, buf: &hello}, nil
+			}
+
+			fp, _, _ := e2eGetURL(t, c, tc.url)
+			if want := strconv.FormatBool(tc.sorted); fp.Sorted != want {
+				t.Errorf("{tls.ja3_sorted} = %q, want %q", fp.Sorted, want)
+			}
+			if want := wireJA3(t, hello, tc.sorted); fp.JA3Raw != want {
+				t.Errorf("{tls.ja3_raw} = %q\n  want (from the wire) %q", fp.JA3Raw, want)
+			}
+			sum := md5.Sum([]byte(fp.JA3Raw))
+			if fp.JA3 != hex.EncodeToString(sum[:]) {
+				t.Errorf("{tls.ja3} = %q is not the MD5 of {tls.ja3_raw}", fp.JA3)
+			}
+		})
 	}
 }
