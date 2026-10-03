@@ -677,3 +677,24 @@ func TestE2E_HooksRegisteredOncePerServer(t *testing.T) {
 		t.Errorf("server still tracked after unloading the config (%d -> %d)", tracked, len(hooks.refs))
 	}
 }
+
+// A flood of QUIC handshakes that never complete (what spoofed sources look
+// like to the server) must not use up the slots TCP clients need. TCP entries
+// are removed when their connection closes, so only QUIC can pile up.
+func TestE2E_QUICFloodDoesNotStarveTCPClients(t *testing.T) {
+	if raceEnabled {
+		t.Skip("skipping under -race: upstream Caddy data race in TLS.Start (see TestE2E_HTTP3)")
+	}
+	srv := startCaddy(t, "", "servers {\n\t\tprotocols h1 h2 h3\n\t}")
+	store.max = 100 // small cap so the test is quick; the default is 100,000
+	t.Cleanup(func() { store.max = defaultMaxEntries })
+
+	floodUnansweredQUIC(t, srv, 250) // far more than the cap
+
+	c := e2eClient(srv, &tls.Config{NextProtos: []string{"http/1.1"}})
+	fp, _, _ := e2eGet(t, c, srv)
+	if fp.JA3 == "" || fp.JA4 == "" {
+		t.Errorf("a TCP client got no fingerprint while %d/%d store slots were taken by unanswered QUIC handshakes",
+			store.Len(), store.max)
+	}
+}

@@ -68,7 +68,7 @@ func recordFingerprint(hello *tls.ClientHelloInfo, sortExtensions bool, logger *
 	fp := TLSFingerprint{JA3: ja3, JA3Raw: ja3Raw, JA4: ja4, Sorted: sortExtensions}
 
 	if !store.Store(hello.Conn, fp) {
-		warnStoreFull(logger)
+		warnStoreFull(logger, transportOf(hello.Conn.RemoteAddr()))
 	}
 	return fp, true
 }
@@ -127,9 +127,10 @@ func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (c
 	return hello.Context(), nil
 }
 
-// warnStoreFull logs that a fingerprint was dropped because the store is full,
-// at most once a minute so a flood cannot also flood the log.
-func warnStoreFull(logger *zap.Logger) {
+// warnStoreFull logs that a fingerprint was dropped because the store, or the
+// QUIC share of it, is full, at most once a minute so a flood cannot also flood
+// the log.
+func warnStoreFull(logger *zap.Logger, transport Transport) {
 	if logger == nil {
 		return
 	}
@@ -138,8 +139,15 @@ func warnStoreFull(logger *zap.Logger) {
 	if now-last < int64(time.Minute) || !lastStoreFullWarn.CompareAndSwap(last, now) {
 		return
 	}
+	if transport == TransportQUIC && store.udp.Load() >= store.quicBudget() {
+		logger.Warn("QUIC share of the fingerprint store is full; dropping fingerprints for new HTTP/3 connections "+
+			"(TCP connections are unaffected)",
+			zap.Int64("quic_entries", store.udp.Load()),
+			zap.Int64("quic_budget", store.quicBudget()))
+		return
+	}
 	logger.Warn("fingerprint store is full; dropping fingerprints for new connections",
-		zap.Int("max_entries", defaultMaxEntries))
+		zap.Int("max_entries", store.max))
 }
 
 // Interface compliance.

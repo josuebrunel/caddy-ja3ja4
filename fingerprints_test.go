@@ -1442,3 +1442,113 @@ func TestServeHTTP_FallbackUsesRequestTransport(t *testing.T) {
 		})
 	}
 }
+
+func tcpAddrConn(i int) *addrConn {
+	return &addrConn{remote: &net.TCPAddr{IP: net.IPv4(10, 1, byte(i>>8), byte(i)), Port: 1000 + i%1000}}
+}
+
+func quicAddrConn(i int) *addrConn {
+	return &addrConn{remote: &net.UDPAddr{IP: net.IPv4(10, 2, byte(i>>8), byte(i)), Port: 1000 + i%1000}}
+}
+
+// QUIC entries may use at most half of the capacity, so TCP clients always keep
+// room however many QUIC handshakes arrive.
+func TestFingerprintStore_QUICHasItsOwnBudget(t *testing.T) {
+	s := NewFingerprintStore()
+	s.max = 10 // QUIC budget: 5
+
+	quic := make([]*addrConn, 8)
+	stored := 0
+	for i := range quic {
+		quic[i] = quicAddrConn(i)
+		if s.Store(quic[i], TLSFingerprint{JA3: "q"}) {
+			stored++
+		}
+	}
+	if stored != 5 {
+		t.Fatalf("stored %d QUIC entries, want exactly the budget of 5", stored)
+	}
+
+	// TCP can still use every remaining slot.
+	for i := 0; i < 5; i++ {
+		if !s.Store(tcpAddrConn(i), TLSFingerprint{JA3: "t"}) {
+			t.Fatalf("TCP entry %d refused although only the QUIC budget is used up", i)
+		}
+	}
+	if s.Store(tcpAddrConn(99), TLSFingerprint{JA3: "t"}) {
+		t.Error("the overall cap must still apply to TCP")
+	}
+	if s.Len() != 10 || s.udp.Load() != 5 {
+		t.Errorf("Len=%d udp=%d, want 10 and 5", s.Len(), s.udp.Load())
+	}
+
+	// Replacing an existing QUIC entry never needs a new slot.
+	if !s.Store(quic[0], TLSFingerprint{JA3: "q2"}) {
+		t.Error("replacing an existing QUIC entry must succeed when the budget is full")
+	}
+
+	// Freeing a QUIC slot makes room for another QUIC entry, not for more.
+	s.Delete(quic[0])
+	if !s.Store(quic[7], TLSFingerprint{JA3: "q"}) {
+		t.Error("a freed QUIC slot must be usable again")
+	}
+	if s.Store(quicAddrConn(50), TLSFingerprint{JA3: "q"}) {
+		t.Error("the QUIC budget must hold after reuse")
+	}
+}
+
+// The counters must stay right however entries leave the store.
+func TestFingerprintStore_QUICCounterTracksDeleteAndSweep(t *testing.T) {
+	s := NewFingerprintStore()
+	var quic, tcp []*addrConn
+	for i := 0; i < 30; i++ {
+		quic = append(quic, quicAddrConn(i))
+		tcp = append(tcp, tcpAddrConn(i))
+		s.Store(quic[i], TLSFingerprint{JA3: "q"})
+		s.Store(tcp[i], TLSFingerprint{JA3: "t"})
+	}
+	if s.udp.Load() != 30 || s.Len() != 60 {
+		t.Fatalf("udp=%d len=%d, want 30 and 60", s.udp.Load(), s.Len())
+	}
+
+	s.Store(quic[0], TLSFingerprint{JA3: "again"}) // replace: no double count
+	for _, c := range quic[:10] {
+		s.Delete(c)
+		s.Delete(c) // twice: no double decrement
+	}
+	for _, c := range tcp[:5] {
+		s.Delete(c) // TCP deletes must not touch the QUIC counter
+	}
+	if s.udp.Load() != 20 || s.Len() != 45 {
+		t.Errorf("after deletes udp=%d len=%d, want 20 and 45", s.udp.Load(), s.Len())
+	}
+
+	s.sweep(0)
+	if s.udp.Load() != 0 || s.Len() != 0 {
+		t.Errorf("after sweeping everything udp=%d len=%d, want 0 and 0", s.udp.Load(), s.Len())
+	}
+}
+
+func TestWarnStoreFull_NamesTheBudgetThatIsFull(t *testing.T) {
+	// Fill only the QUIC share of the global store.
+	resetStore(t)
+	old := store.max
+	store.max = 4
+	t.Cleanup(func() { store.max = old; lastStoreFullWarn.Store(0) })
+	for i := 0; i < 2; i++ {
+		store.Store(quicAddrConn(i), TLSFingerprint{JA3: "q"})
+	}
+
+	lastStoreFullWarn.Store(0)
+	core, logs := observer.New(zap.WarnLevel)
+	warnStoreFull(zap.New(core), TransportQUIC)
+	if logs.Len() != 1 || !strings.Contains(logs.All()[0].Message, "QUIC share") {
+		t.Errorf("expected the QUIC-share warning, got %v", logs.All())
+	}
+
+	// Rate limited: a second call within a minute logs nothing.
+	warnStoreFull(zap.New(core), TransportQUIC)
+	if logs.Len() != 1 {
+		t.Errorf("the warning must be rate limited, got %d", logs.Len())
+	}
+}

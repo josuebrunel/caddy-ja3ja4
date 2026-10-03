@@ -56,6 +56,7 @@ type storeShard struct {
 type FingerprintStore struct {
 	shards [shardCount]storeShard
 	size   atomic.Int64 // entries across all shards, enforced against max
+	udp    atomic.Int64 // the QUIC share of size, enforced against max/2
 	max    int
 	ttl    atomic.Int64 // time.Duration; see EnsureTTL
 
@@ -137,20 +138,42 @@ func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 	e := &fingerprintEntry{fp: fp}
 	e.lastSeen.Store(time.Now().UnixNano())
 
+	quic := isQUICKey(key)
 	sh := shard(s, key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if _, exists := sh.m[key]; !exists {
-		// The cap is checked against the store-wide count, so it can be
-		// overshot by a few entries when shards race; it is a safety bound,
-		// not an exact quota.
+		// The caps are checked against store-wide counts, so they can be
+		// overshot by a few entries when shards race; they are safety bounds,
+		// not exact quotas.
 		if s.size.Load() >= int64(s.max) {
 			return false
+		}
+		// QUIC entries get only half of the capacity. A TCP entry is removed
+		// when its connection closes, but QUIC has no close hook, so QUIC
+		// entries linger until they expire and a flood of QUIC handshakes (they
+		// are processed before the client's address is verified) could
+		// otherwise use every slot and leave TCP clients without a fingerprint.
+		if quic {
+			if s.udp.Load() >= s.quicBudget() {
+				return false
+			}
+			s.udp.Add(1)
 		}
 		s.size.Add(1)
 	}
 	sh.m[key] = e
 	return true
+}
+
+// quicBudget is how many entries QUIC connections may hold at once.
+func (s *FingerprintStore) quicBudget() int64 {
+	return int64(s.max) / 2
+}
+
+// isQUICKey reports whether a store key belongs to a QUIC connection.
+func isQUICKey[K ~string | ~[]byte](key K) bool {
+	return len(key) > 0 && key[0] == byte(TransportQUIC)
 }
 
 // Load retrieves the fingerprint for the given connection.
@@ -201,7 +224,15 @@ func (s *FingerprintStore) Delete(conn net.Conn) {
 	defer sh.mu.Unlock()
 	if _, ok := sh.m[key]; ok {
 		delete(sh.m, key)
-		s.size.Add(-1)
+		s.forget(key)
+	}
+}
+
+// forget updates the counters for an entry that was just removed.
+func (s *FingerprintStore) forget(key string) {
+	s.size.Add(-1)
+	if isQUICKey(key) {
+		s.udp.Add(-1)
 	}
 }
 
@@ -220,7 +251,7 @@ func (s *FingerprintStore) sweep(ttl time.Duration) {
 		for key, e := range sh.m {
 			if e.lastSeen.Load() < cutoff {
 				delete(sh.m, key)
-				s.size.Add(-1)
+				s.forget(key)
 			}
 		}
 		sh.mu.Unlock()
@@ -290,6 +321,9 @@ const (
 
 // transportOf reports which transport an address belongs to.
 func transportOf(addr net.Addr) Transport {
+	if addr == nil {
+		return TransportTCP
+	}
 	switch a := addr.(type) {
 	case *net.TCPAddr:
 		return TransportTCP
