@@ -180,20 +180,32 @@ func (m *JA3JA4) Validate() error {
 
 // UnmarshalCaddyfile sets up from Caddyfile.
 func (m *JA3JA4) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	sorted, err := parseSortOption(d)
+	if err != nil {
+		return err
+	}
+	m.SortJA3Extensions = sorted
+	return nil
+}
+
+// parseSortOption parses the directive block shared by the handler and the TLS
+// context module: the only subdirective is the argument-less
+// sort_ja3_extensions flag.
+func parseSortOption(d *caddyfile.Dispenser) (sortExtensions bool, err error) {
 	for d.Next() {
 		for nesting := d.Nesting(); d.NextBlock(nesting); {
 			switch d.Val() {
 			case "sort_ja3_extensions":
 				if d.NextArg() {
-					return d.ArgErr()
+					return false, d.ArgErr()
 				}
-				m.SortJA3Extensions = true
+				sortExtensions = true
 			default:
-				return d.Errf("unrecognized subdirective: %s", d.Val())
+				return false, d.Errf("unrecognized subdirective: %s", d.Val())
 			}
 		}
 	}
-	return nil
+	return sortExtensions, nil
 }
 
 // parseCaddyfile parses the Caddyfile directive.

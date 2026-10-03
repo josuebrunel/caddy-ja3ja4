@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
@@ -1217,4 +1218,29 @@ func TestServerHooks_RegisteredOncePerServer(t *testing.T) {
 		t.Errorf("servers leaked after all handlers were cleaned up: %d tracked", len(h.refs))
 	}
 	h.release(a) // unbalanced release must be harmless
+}
+
+func TestParseSortOption(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		input   string
+		want    bool
+		wantErr bool
+	}{
+		{"bare directive", `ja3_ja4`, false, false},
+		{"empty block", "ja3_ja4 {\n}", false, false},
+		{"flag", "ja3_ja4 {\n\tsort_ja3_extensions\n}", true, false},
+		{"flag with an argument", "ja3_ja4 {\n\tsort_ja3_extensions yes\n}", false, true},
+		{"unknown subdirective", "ja3_ja4 {\n\tnope\n}", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseSortOption(caddyfile.NewTestDispenser(tc.input))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("sort = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

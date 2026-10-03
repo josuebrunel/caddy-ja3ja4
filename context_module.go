@@ -106,19 +106,11 @@ func (m *HandshakeContextModule) Provision(ctx caddy.Context) error {
 
 // UnmarshalCaddyfile sets up from Caddyfile (for direct use, not via HTTP handler).
 func (m *HandshakeContextModule) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			switch d.Val() {
-			case "sort_ja3_extensions":
-				if d.NextArg() {
-					return d.ArgErr()
-				}
-				m.SortJA3Extensions = true
-			default:
-				return d.Errf("unrecognized subdirective: %s", d.Val())
-			}
-		}
+	sorted, err := parseSortOption(d)
+	if err != nil {
+		return err
 	}
+	m.SortJA3Extensions = sorted
 	return nil
 }
 
