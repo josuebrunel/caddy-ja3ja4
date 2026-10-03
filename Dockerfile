@@ -1,6 +1,10 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
-RUN apk add --no-cache git build-base
+# Keep in sync with go.mod. Pinned so image builds are reproducible.
+ARG XCADDY_VERSION=v0.4.7
+ARG CADDY_VERSION=v2.11.4
+
+RUN apk add --no-cache git
 
 WORKDIR /build
 
@@ -9,8 +13,8 @@ RUN go mod download
 
 COPY . .
 
-RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest && \
-    CGO_ENABLED=1 xcaddy build \
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION} && \
+    CGO_ENABLED=0 xcaddy build ${CADDY_VERSION} \
       --with github.com/josuebrunel/caddy-ja3ja4=. \
       --output /caddy
 
