@@ -75,6 +75,11 @@ func recordFingerprint(hello *tls.ClientHelloInfo, sortExtensions bool, logger *
 
 // HandshakeContextModule implements caddytls.HandshakeContext to compute
 // JA3/JA4 fingerprints during the TLS handshake.
+//
+// The ja3_ja4 handler no longer installs it: that hook is skipped for resumed
+// TLS 1.3 sessions, so HandshakeMatcher does the recording instead. It remains
+// registered so existing JSON configs that reference tls.context.ja3ja4 keep
+// working.
 type HandshakeContextModule struct {
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
@@ -117,20 +122,17 @@ func (m *HandshakeContextModule) UnmarshalCaddyfile(d *caddyfile.Dispenser) erro
 	return nil
 }
 
-// HandshakeContext is invoked during the TLS handshake. It computes
-// JA3/JA4 fingerprints and embeds them in the returned context so
-// that ServeHTTP can retrieve them directly. The fingerprint is also
-// stored in the global store as a backup for HTTP/3 and other edge
-// cases where context propagation may not reach the request handler.
+// HandshakeContext is invoked while Caddy selects a certificate. It records
+// the connection's JA3/JA4 fingerprints in the global store, where ServeHTTP
+// finds them. It returns the handshake context unchanged: Caddy only hands
+// that context to certificate selection, so nothing placed on it would reach
+// the request.
 func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
 	if hello == nil {
 		return context.Background(), nil
 	}
-	fp, ok := recordFingerprint(hello, m.SortJA3Extensions, m.logger)
-	if !ok {
-		return hello.Context(), nil
-	}
-	return context.WithValue(hello.Context(), fpCtxKey{}, fp), nil
+	recordFingerprint(hello, m.SortJA3Extensions, m.logger)
+	return hello.Context(), nil
 }
 
 // warnStoreFull logs that a fingerprint was dropped because the store is full,

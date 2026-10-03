@@ -11,17 +11,18 @@ import (
 )
 
 type connCtxKey struct{}
-type fpCtxKey struct{}
 
 // ServeHTTP implements the middleware handler. It retrieves the net.Conn
 // from the request context, looks up the JA3/JA4 fingerprint in the
 // global store, and sets placeholders on the replacer (empty when the request
 // has no fingerprint).
 //
-// The lookup order is:
-//  1. TLSFingerprint embedded directly in the request context (via HandshakeContext callback)
-//  2. net.Conn value in the request context → global store lookup by remote address
-//  3. RemoteAddr from the request → global store lookup by remote address (HTTP/3 fallback)
+// Fingerprints live in the global store, keyed by the connection's remote
+// address (the handshake context Caddy gives modules never reaches the
+// request, so there is nothing to read from the request context). The lookup
+// order is:
+//  1. net.Conn value in the request context (set by connContextFunc) → store lookup
+//  2. RemoteAddr from the request → store lookup (HTTP/3, where there is no net.Conn)
 func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey)
 	if repl == nil {
@@ -35,17 +36,14 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	var fp TLSFingerprint
 	var found bool
 
-	// 1. Check if the fingerprint was embedded directly in the context by HandshakeContext.
-	if fp, found = r.Context().Value(fpCtxKey{}).(TLSFingerprint); !found {
-		// 2. Fallback to looking up in the global store via the net.Conn from the request context.
-		if conn, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok {
-			fp, found = store.Load(conn)
-		}
+	// 1. The net.Conn from the request context.
+	if conn, ok := r.Context().Value(connCtxKey{}).(net.Conn); ok {
+		fp, found = store.Load(conn)
 	}
 
+	// 2. HTTP/3 has no net.Conn in the request context, so fall back to the
+	// request's remote address.
 	if !found {
-		// 3. Fallback for HTTP/3 where the net.Conn is not available in the request context.
-		// Use the remote address from the request to look up the fingerprint.
 		fp, found = store.LoadByRemoteAddr(r.RemoteAddr)
 	}
 

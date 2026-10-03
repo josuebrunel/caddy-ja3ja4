@@ -999,3 +999,22 @@ func TestConnStateFunc_IdleRestartsTheTTLClock(t *testing.T) {
 		t.Error("a genuinely stale entry must still be swept")
 	}
 }
+
+// tls.context.ja3ja4 is no longer installed automatically but must keep
+// recording for JSON configs that still reference it.
+func TestHandshakeContextModule_StillRecords(t *testing.T) {
+	conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.88:9100"}}
+	t.Cleanup(func() { store.Delete(conn) })
+
+	m := &HandshakeContextModule{}
+	if _, err := m.HandshakeContext(&tls.ClientHelloInfo{
+		Conn:              conn,
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		Extensions:        []uint16{0, 43},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fp, ok := store.Load(conn); !ok || len(fp.JA3) != 32 {
+		t.Errorf("fingerprint not recorded: %+v ok=%v", fp, ok)
+	}
+}
