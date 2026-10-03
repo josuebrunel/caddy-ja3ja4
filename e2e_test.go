@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -494,5 +497,160 @@ func TestE2E_HandlersShareOneSweeper(t *testing.T) {
 	}
 	if got := sweepRefs(); got != refsBefore {
 		t.Errorf("sweeper references after unloading = %d, want %d", got, refsBefore)
+	}
+}
+
+// recordingConn keeps the bytes the client writes first, which for a TLS
+// client is its ClientHello.
+type recordingConn struct {
+	net.Conn
+	buf *[]byte
+}
+
+func (c *recordingConn) Write(p []byte) (int, error) {
+	if len(*c.buf) < 1<<15 {
+		*c.buf = append(*c.buf, p...)
+	}
+	return c.Conn.Write(p)
+}
+
+// wireJA3 computes the JA3 string straight from the bytes of a ClientHello
+// record, independently of crypto/tls' parsing, so it can serve as a
+// reference for what the module reports.
+func wireJA3(t *testing.T, raw []byte, sorted bool) string {
+	t.Helper()
+	be16 := func(b []byte) int { return int(b[0])<<8 | int(b[1]) }
+	grease := func(v int) bool { return v&0x0f0f == 0x0a0a && v>>8 == v&0xff }
+	need := func(b []byte, n int) {
+		if len(b) < n {
+			t.Fatalf("truncated ClientHello (need %d bytes, have %d)", n, len(b))
+		}
+	}
+
+	need(raw, 5)
+	if raw[0] != 0x16 {
+		t.Fatalf("first client write is not a TLS handshake record: %#x", raw[0])
+	}
+	rec := raw[5:]
+	need(rec, 4)
+	if rec[0] != 1 {
+		t.Fatalf("not a ClientHello: handshake type %d", rec[0])
+	}
+	hsLen := int(rec[1])<<16 | int(rec[2])<<8 | int(rec[3])
+	b := rec[4:]
+	need(b, hsLen)
+	b = b[:hsLen]
+
+	need(b, 2+32+1)
+	version := be16(b)
+	b = b[2+32:]
+	sid := int(b[0])
+	need(b, 1+sid+2)
+	b = b[1+sid:]
+	csLen := be16(b)
+	need(b, 2+csLen+1)
+	suites := b[2 : 2+csLen]
+	b = b[2+csLen:]
+	comp := int(b[0])
+	need(b, 1+comp+2)
+	b = b[1+comp:]
+	extLen := be16(b)
+	need(b, 2+extLen)
+	exts := b[2 : 2+extLen]
+
+	var ciphers, extIDs, curves, points []int
+	for i := 0; i+1 < len(suites); i += 2 {
+		if v := be16(suites[i:]); !grease(v) {
+			ciphers = append(ciphers, v)
+		}
+	}
+	for len(exts) >= 4 {
+		typ, l := be16(exts), be16(exts[2:])
+		need(exts, 4+l)
+		data := exts[4 : 4+l]
+		exts = exts[4+l:]
+		if grease(typ) {
+			continue
+		}
+		extIDs = append(extIDs, typ)
+		switch typ {
+		case 10: // supported_groups
+			n := be16(data)
+			for i := 0; i+1 < n; i += 2 {
+				if v := be16(data[2+i:]); !grease(v) {
+					curves = append(curves, v)
+				}
+			}
+		case 11: // ec_point_formats
+			for _, f := range data[1 : 1+int(data[0])] {
+				points = append(points, int(f))
+			}
+		}
+	}
+
+	join := func(vs []int) string {
+		if sorted {
+			vs = append([]int(nil), vs...)
+			sort.Ints(vs)
+		}
+		parts := make([]string, len(vs))
+		for i, v := range vs {
+			parts[i] = strconv.Itoa(v)
+		}
+		return strings.Join(parts, "-")
+	}
+	// JA3 never sorts the cipher list, only (per this module's option) the rest.
+	cipherStrs := make([]string, len(ciphers))
+	for i, v := range ciphers {
+		cipherStrs[i] = strconv.Itoa(v)
+	}
+	return fmt.Sprintf("%d,%s,%s,%s,%s", version, strings.Join(cipherStrs, "-"), join(extIDs), join(curves), join(points))
+}
+
+// The JA3 string the module reports must equal what an independent parse of
+// the client's actual ClientHello bytes gives: real client_version, wire order
+// of extensions, curves and point formats.
+func TestE2E_JA3MatchesWireClientHello(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version uint16
+		sorted  bool
+	}{
+		{"TLS 1.3", tls.VersionTLS13, false},
+		{"TLS 1.2", tls.VersionTLS12, false},
+		{"TLS 1.3 sorted", tls.VersionTLS13, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := ""
+			if tc.sorted {
+				body = `
+		ja3_ja4 {
+			sort_ja3_extensions
+		}
+		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`
+			}
+			srv := startCaddy(t, body)
+
+			var hello []byte
+			c := e2eClient(srv, &tls.Config{MinVersion: tc.version, MaxVersion: tc.version, NextProtos: []string{"http/1.1"}})
+			tr := c.Transport.(*http.Transport)
+			dial := tr.DialContext
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return &recordingConn{Conn: conn, buf: &hello}, nil
+			}
+
+			fp, _, _ := e2eGet(t, c, srv)
+			if want := wireJA3(t, hello, tc.sorted); fp.JA3Raw != want {
+				t.Errorf("{tls.ja3_raw} = %q\n  want (from the wire) %q", fp.JA3Raw, want)
+			}
+			sum := md5.Sum([]byte(fp.JA3Raw))
+			if fp.JA3 != hex.EncodeToString(sum[:]) {
+				t.Errorf("{tls.ja3} = %q is not the MD5 of {tls.ja3_raw}", fp.JA3)
+			}
+		})
 	}
 }

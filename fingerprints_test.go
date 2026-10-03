@@ -1148,3 +1148,60 @@ func TestFingerprintStore_LenTracksStoreDeleteAndSweep(t *testing.T) {
 		t.Errorf("Len after sweeping everything = %d, want 0", s.Len())
 	}
 }
+
+// Known-answer vector from the JA3 specification's own README
+// (github.com/salesforce/ja3). The hash was also re-derived with md5sum.
+func TestComputeJA3_ReferenceVector(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		SupportedVersions: []uint16{tls.VersionTLS10}, // 769
+		CipherSuites:      []uint16{47, 53, 5, 10, 49161, 49162, 49171, 49172, 50, 56, 19, 4},
+		Extensions:        []uint16{0, 10, 11},
+		SupportedCurves:   []tls.CurveID{23, 24, 25},
+		SupportedPoints:   []uint8{0},
+	}
+	raw, hash := computeJA3(chi, false)
+
+	const wantRaw = "769,47-53-5-10-49161-49162-49171-49172-50-56-19-4,0-10-11,23-24-25,0"
+	const wantHash = "ada70206e40642a3e4461f35503241d5"
+	if raw != wantRaw {
+		t.Errorf("JA3 string = %q, want %q", raw, wantRaw)
+	}
+	if hash != wantHash {
+		t.Errorf("JA3 hash = %q, want %q", hash, wantHash)
+	}
+}
+
+// Chrome's published JA4 is t13d1516h2_8daaf6152771_02705d924276 (FoxIO). The
+// middle segment is the SHA-256 (first 12 hex chars) of Chrome's 15 cipher
+// suites sorted and comma-joined, which was re-derived independently. The
+// last segment depends on the exact extension/signature-algorithm lists of the
+// capture and cannot be reproduced here, so only the first two are asserted.
+// GREASE values are mixed in everywhere to prove they are ignored.
+func TestComputeJA4_ChromeReferenceSegments(t *testing.T) {
+	chi := &tls.ClientHelloInfo{
+		ServerName:        "example.com", // SNI present -> 'd'
+		SupportedProtos:   []string{"h2", "http/1.1"},
+		SupportedVersions: []uint16{0x7a7a, tls.VersionTLS13, tls.VersionTLS12},
+		CipherSuites: []uint16{
+			0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
+			0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+		},
+		// 16 real extensions (incl. SNI and ALPN) plus GREASE ones.
+		Extensions: []uint16{
+			0x2a2a, 0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 17513, 21, 0xfafa,
+		},
+		SignatureSchemes: []tls.SignatureScheme{0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601},
+	}
+
+	got := computeJA4(chi)
+	parts := strings.Split(got, "_")
+	if len(parts) != 3 {
+		t.Fatalf("JA4 %q does not have 3 segments", got)
+	}
+	if parts[0] != "t13d1516h2" {
+		t.Errorf("JA4 prefix = %q, want t13d1516h2", parts[0])
+	}
+	if parts[1] != "8daaf6152771" {
+		t.Errorf("JA4 cipher hash = %q, want 8daaf6152771", parts[1])
+	}
+}
