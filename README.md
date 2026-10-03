@@ -47,24 +47,17 @@ docker compose up -d
 
 ### Caddyfile
 
-The plugin is configured entirely through the HTTP handler. No TLS block configuration is needed.
+The plugin is configured entirely through the HTTP handler. No TLS block and no global `order` option are needed: the directive registers itself to run before `header`, so the placeholders are available to `header`, `reverse_proxy`, `respond` and `log_append`.
 
 ```caddyfile
-{
-    order ja3_ja4 first
-}
-
 example.com {
     ja3_ja4
-
-    log {
-        output file /var/log/caddy/access.log
-        format json
-    }
 
     respond "JA3: {tls.ja3} | JA4: {tls.ja4}"
 }
 ```
+
+Fingerprints are recorded for every TLS connection on a Caddy server, i.e. all sites sharing a listening port, as soon as one of them uses `ja3_ja4`, including resumed TLS 1.3 sessions and HTTP/3. Requests without a fingerprint, such as plain HTTP, get empty placeholders.
 
 ### Options
 
@@ -130,6 +123,9 @@ example.com {
 
 ### Log Fingerprints
 
+Caddy's access log doesn't know about custom placeholders, so add them with
+[`log_append`](https://caddyserver.com/docs/caddyfile/directives/log_append):
+
 ```caddyfile
 example.com {
     ja3_ja4
@@ -138,10 +134,14 @@ example.com {
         output file /var/log/caddy/access.log
         format json
     }
+    log_append ja3 {tls.ja3}
+    log_append ja4 {tls.ja4}
 
     respond "OK"
 }
 ```
+
+Each access-log line then carries `"ja3": "..."` and `"ja4": "..."`.
 
 ### Route Based on Fingerprint
 
