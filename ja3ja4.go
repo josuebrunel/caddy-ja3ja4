@@ -7,6 +7,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
 )
 
@@ -60,24 +61,8 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 		return nil
 	}
 
-	matcherJSON, err := json.Marshal(map[string]any{
-		"sort_ja3_extensions": m.SortJA3Extensions,
-	})
-	if err != nil {
+	if err := installMatcher(srv.TLSConnPolicies, m.SortJA3Extensions, m.logger); err != nil {
 		return err
-	}
-
-	// Record fingerprints from a connection-policy matcher: unlike the
-	// handshake context hook it runs for every ClientHello, including TLS 1.3
-	// resumptions that never select a certificate. Don't replace a matcher a
-	// previous handler already installed.
-	for _, cp := range srv.TLSConnPolicies {
-		if cp.MatchersRaw == nil {
-			cp.MatchersRaw = make(caddy.ModuleMap)
-		}
-		if _, exists := cp.MatchersRaw[matcherName]; !exists {
-			cp.MatchersRaw[matcherName] = matcherJSON
-		}
 	}
 
 	srv.RegisterConnContext(connContextFunc)
@@ -85,6 +70,43 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 
 	store.StartSweeper(ctx.Context)
 
+	return nil
+}
+
+// installMatcher records fingerprints from a connection-policy matcher: unlike
+// the handshake context hook it runs for every ClientHello, including TLS 1.3
+// resumptions that never select a certificate.
+//
+// The first handler to provision on a server wins: an existing matcher is never
+// replaced. Handlers cannot be tied to individual policies (a policy is picked
+// by SNI before any route runs), so the sort setting is effectively
+// server-wide, and a later handler asking for a different one gets a warning.
+// {tls.ja3_sorted} always reports what was really used.
+func installMatcher(policies caddytls.ConnectionPolicies, sortExtensions bool, logger *zap.Logger) error {
+	matcherJSON, err := json.Marshal(HandshakeMatcher{SortJA3Extensions: sortExtensions})
+	if err != nil {
+		return err
+	}
+
+	for _, cp := range policies {
+		if cp.MatchersRaw == nil {
+			cp.MatchersRaw = make(caddy.ModuleMap)
+		}
+		existing, exists := cp.MatchersRaw[matcherName]
+		if !exists {
+			cp.MatchersRaw[matcherName] = matcherJSON
+			continue
+		}
+
+		var installed HandshakeMatcher
+		if err := json.Unmarshal(existing, &installed); err == nil && installed.SortJA3Extensions != sortExtensions {
+			logger.Warn("another ja3_ja4 handler on this server already set sort_ja3_extensions differently; "+
+				"the first one wins for every site on the server, {tls.ja3_sorted} reports what is actually used",
+				zap.Bool("in_effect", installed.SortJA3Extensions),
+				zap.Bool("ignored", sortExtensions))
+			return nil // identical for every remaining policy
+		}
+	}
 	return nil
 }
 

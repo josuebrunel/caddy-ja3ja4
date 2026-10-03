@@ -65,7 +65,7 @@ func recordFingerprint(hello *tls.ClientHelloInfo, sortExtensions bool, logger *
 	}
 
 	ja3Raw, ja3, ja4 := computeFingerprints(hello, sortExtensions)
-	fp := TLSFingerprint{JA3: ja3, JA3Raw: ja3Raw, JA4: ja4}
+	fp := TLSFingerprint{JA3: ja3, JA3Raw: ja3Raw, JA4: ja4, Sorted: sortExtensions}
 
 	if !store.Store(hello.Conn, fp) {
 		warnStoreFull(logger)

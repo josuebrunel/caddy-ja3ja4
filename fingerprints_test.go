@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,9 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestComputeJA3_NilInput(t *testing.T) {
@@ -808,4 +813,127 @@ func TestServeHTTP_NoFingerprint_PlaceholdersAreEmpty(t *testing.T) {
 			t.Errorf("%s: header-style replacement = %q, want %q", key, got, "[]")
 		}
 	}
+}
+
+// {tls.ja3_sorted} must describe how the stored hash was computed, not the
+// config of whichever handler happens to serve the request.
+func TestServeHTTP_ReportsSortedFromFingerprint(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		fpSorted    bool
+		handlerSort bool
+		want        string
+	}{
+		{"hash sorted, handler unsorted", true, false, "true"},
+		{"hash unsorted, handler sorted", false, true, "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.50:7000"}}
+			store.Store(conn, TLSFingerprint{JA3: "abc", JA4: "def", JA3Raw: "raw", Sorted: tc.fpSorted})
+			t.Cleanup(func() { store.Delete(conn) })
+
+			repl := caddy.NewReplacer()
+			ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+			ctx = context.WithValue(ctx, connCtxKey{}, net.Conn(conn))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+
+			next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+			m := &JA3JA4{SortJA3Extensions: tc.handlerSort}
+			if err := m.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+				t.Fatal(err)
+			}
+			if got := repl.ReplaceAll("{tls.ja3_sorted}", ""); got != tc.want {
+				t.Errorf("{tls.ja3_sorted} = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHandshakeMatcher_RecordsSortedFlag(t *testing.T) {
+	for _, sorted := range []bool{false, true} {
+		conn := &mockConn{remoteAddr: &mockAddr{s: fmt.Sprintf("192.0.2.60:%d", 8000+btoi(sorted))}}
+		t.Cleanup(func() { store.Delete(conn) })
+		(&HandshakeMatcher{SortJA3Extensions: sorted}).Match(&tls.ClientHelloInfo{
+			Conn:              conn,
+			SupportedVersions: []uint16{tls.VersionTLS13},
+			Extensions:        []uint16{16, 0},
+		})
+		if fp, ok := store.Load(conn); !ok || fp.Sorted != sorted {
+			t.Errorf("sorted=%v: stored fingerprint has Sorted=%v (found=%v)", sorted, fp.Sorted, ok)
+		}
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func TestInstallMatcher(t *testing.T) {
+	newPolicies := func() caddytls.ConnectionPolicies {
+		return caddytls.ConnectionPolicies{{}, {}}
+	}
+	sortOf := func(t *testing.T, cp *caddytls.ConnectionPolicy) bool {
+		t.Helper()
+		var m HandshakeMatcher
+		if err := json.Unmarshal(cp.MatchersRaw[matcherName], &m); err != nil {
+			t.Fatal(err)
+		}
+		return m.SortJA3Extensions
+	}
+
+	t.Run("installs in every policy", func(t *testing.T) {
+		cps := newPolicies()
+		if err := installMatcher(cps, true, zap.NewNop()); err != nil {
+			t.Fatal(err)
+		}
+		for i, cp := range cps {
+			if _, ok := cp.MatchersRaw[matcherName]; !ok || !sortOf(t, cp) {
+				t.Errorf("policy %d: matcher missing or not sorted", i)
+			}
+		}
+	})
+
+	t.Run("keeps other matchers", func(t *testing.T) {
+		cps := newPolicies()
+		cps[0].MatchersRaw = caddy.ModuleMap{"sni": json.RawMessage(`["example.com"]`)}
+		if err := installMatcher(cps, false, zap.NewNop()); err != nil {
+			t.Fatal(err)
+		}
+		if string(cps[0].MatchersRaw["sni"]) != `["example.com"]` {
+			t.Error("existing matcher was modified")
+		}
+	})
+
+	t.Run("first handler wins and a conflict is logged", func(t *testing.T) {
+		cps := newPolicies()
+		core, logs := observer.New(zap.WarnLevel)
+
+		if err := installMatcher(cps, false, zap.New(core)); err != nil {
+			t.Fatal(err)
+		}
+		if err := installMatcher(cps, true, zap.New(core)); err != nil {
+			t.Fatal(err)
+		}
+		for i, cp := range cps {
+			if sortOf(t, cp) {
+				t.Errorf("policy %d: the later handler replaced the first one's setting", i)
+			}
+		}
+		if logs.Len() != 1 {
+			t.Errorf("expected exactly one warning for the conflict, got %d", logs.Len())
+		}
+	})
+
+	t.Run("same setting is silent", func(t *testing.T) {
+		cps := newPolicies()
+		core, logs := observer.New(zap.WarnLevel)
+		_ = installMatcher(cps, true, zap.New(core))
+		_ = installMatcher(cps, true, zap.New(core))
+		if logs.Len() != 0 {
+			t.Errorf("unexpected warning: %v", logs.All())
+		}
+	})
 }

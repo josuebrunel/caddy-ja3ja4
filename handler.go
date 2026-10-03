@@ -55,7 +55,7 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	// plain HTTP, gets empty values instead.
 	sorted := ""
 	if found {
-		sorted = strconv.FormatBool(m.SortJA3Extensions)
+		sorted = strconv.FormatBool(fp.Sorted)
 	}
 	rp.Set("tls.ja3", fp.JA3)
 	rp.Set("tls.ja4", fp.JA4)

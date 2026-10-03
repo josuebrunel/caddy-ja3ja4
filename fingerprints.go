@@ -158,6 +158,10 @@ type TLSFingerprint struct {
 	JA3    string
 	JA3Raw string
 	JA4    string
+	// Sorted records whether the JA3 was computed with extensions, curves and
+	// point formats sorted (sort_ja3_extensions), so the value reported to
+	// requests matches how the hash was really produced.
+	Sorted bool
 }
 
 // isGREASE reports whether v is a GREASE value as defined in RFC 8701.

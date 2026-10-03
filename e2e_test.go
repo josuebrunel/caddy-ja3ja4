@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -431,4 +432,32 @@ func TestE2E_HTTP3(t *testing.T) {
 		second := e2eGetH3(t, tr2, srv)
 		assertFingerprints(t, second, "q13d")
 	})
+}
+
+func TestE2E_SortedFlagMatchesHash(t *testing.T) {
+	srv := startCaddy(t, `
+		ja3_ja4 {
+			sort_ja3_extensions
+		}
+		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`)
+
+	c := e2eClient(srv, &tls.Config{NextProtos: []string{"http/1.1"}})
+	fp, _, _ := e2eGet(t, c, srv)
+	if fp.Sorted != "true" {
+		t.Fatalf("{tls.ja3_sorted} = %q, want true", fp.Sorted)
+	}
+
+	// The raw string must really be sorted: extension IDs ascending.
+	parts := strings.Split(fp.JA3Raw, ",")
+	if len(parts) != 5 {
+		t.Fatalf("unexpected JA3 raw %q", fp.JA3Raw)
+	}
+	prev := -1
+	for _, id := range strings.Split(parts[2], "-") {
+		n, err := strconv.Atoi(id)
+		if err != nil || n < prev {
+			t.Fatalf("extensions are not sorted ascending in %q", fp.JA3Raw)
+		}
+		prev = n
+	}
 }
