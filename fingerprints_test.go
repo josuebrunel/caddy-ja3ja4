@@ -534,6 +534,7 @@ func (a *mockAddr) Network() string { return "tcp" }
 func (a *mockAddr) String() string  { return a.s }
 
 func TestServeHTTP_PlaceholderInjection(t *testing.T) {
+	resetStore(t)
 	conn := &mockConn{remoteAddr: &mockAddr{s: "1.2.3.4:9999"}}
 
 	fp := TLSFingerprint{JA3: "abc123", JA3Raw: "771,49195,,23,0", JA4: "t13d0100h2_abc_def"}
@@ -578,6 +579,7 @@ func TestServeHTTP_PlaceholderInjection(t *testing.T) {
 }
 
 func TestServeHTTP_NoConn_CallsNext(t *testing.T) {
+	resetStore(t)
 	repl := caddy.NewReplacer()
 	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
@@ -709,6 +711,7 @@ func TestFingerprintStore_CapDropsNewEntries(t *testing.T) {
 }
 
 func TestConnStateFunc_DeletesOnClose(t *testing.T) {
+	resetStore(t)
 	for _, closing := range []http.ConnState{http.StateClosed, http.StateHijacked} {
 		conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.1:4000"}}
 		store.Store(conn, TLSFingerprint{JA3: "x"})
@@ -763,6 +766,7 @@ func TestComputeJA4_TransportPrefix(t *testing.T) {
 }
 
 func TestHandshakeMatcher_RecordsAndAlwaysMatches(t *testing.T) {
+	resetStore(t)
 	m := &HandshakeMatcher{}
 	if !m.Match(nil) {
 		t.Error("Match(nil) must still report true so it never changes policy selection")
@@ -792,6 +796,7 @@ func TestHandshakeMatcher_RecordsAndAlwaysMatches(t *testing.T) {
 // leaves unknown placeholders as literal text in header values, which would
 // send "{tls.ja3}" to the upstream.
 func TestServeHTTP_NoFingerprint_PlaceholdersAreEmpty(t *testing.T) {
+	resetStore(t)
 	repl := caddy.NewReplacer()
 	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
@@ -814,6 +819,7 @@ func TestServeHTTP_NoFingerprint_PlaceholdersAreEmpty(t *testing.T) {
 // {tls.ja3_sorted} must describe how the stored hash was computed, not the
 // config of whichever handler happens to serve the request.
 func TestServeHTTP_ReportsSortedFromFingerprint(t *testing.T) {
+	resetStore(t)
 	for _, tc := range []struct {
 		name        string
 		fpSorted    bool
@@ -846,6 +852,7 @@ func TestServeHTTP_ReportsSortedFromFingerprint(t *testing.T) {
 }
 
 func TestHandshakeMatcher_RecordsSortedFlag(t *testing.T) {
+	resetStore(t)
 	for _, sorted := range []bool{false, true} {
 		conn := &mockConn{remoteAddr: &mockAddr{s: fmt.Sprintf("192.0.2.60:%d", 8000+btoi(sorted))}}
 		t.Cleanup(func() { store.Delete(conn) })
@@ -982,6 +989,7 @@ func TestFingerprintStore_EnsureTTLOnlyGrows(t *testing.T) {
 // A request can outlive the TTL (large download, slow upstream); the entry must
 // survive until the connection has been idle for a full TTL after it.
 func TestConnStateFunc_IdleRestartsTheTTLClock(t *testing.T) {
+	resetStore(t)
 	conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.77:6000"}}
 	store.Store(conn, TLSFingerprint{JA3: "x"})
 	t.Cleanup(func() { store.Delete(conn) })
@@ -1007,6 +1015,7 @@ func TestConnStateFunc_IdleRestartsTheTTLClock(t *testing.T) {
 // tls.context.ja3ja4 is no longer installed automatically but must keep
 // recording for JSON configs that still reference it.
 func TestHandshakeContextModule_StillRecords(t *testing.T) {
+	resetStore(t)
 	conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.88:9100"}}
 	t.Cleanup(func() { store.Delete(conn) })
 
@@ -1056,6 +1065,7 @@ func TestFingerprintStore_SharedSweeperIsRefCounted(t *testing.T) {
 }
 
 func TestJA3JA4_CleanupReleasesOnlyWhatItAcquired(t *testing.T) {
+	resetStore(t)
 	before := sweepRefs()
 
 	unprovisioned := &JA3JA4{}

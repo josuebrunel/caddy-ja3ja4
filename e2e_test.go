@@ -58,6 +58,8 @@ type e2eServer struct {
 func startCaddy(t *testing.T, siteBody string, globalOpts ...string) *e2eServer {
 	t.Helper()
 
+	resetStore(t) // registered first, so it also runs after Caddy has stopped
+
 	// Keep Caddy's state out of the developer's home directory.
 	dir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
@@ -275,8 +277,6 @@ func TestE2E_KeepAliveKeepsFingerprint(t *testing.T) {
 // grows the store until the TTL sweeper catches up.
 func TestE2E_FingerprintRemovedWhenConnectionCloses(t *testing.T) {
 	srv := startCaddy(t, "")
-	store.sweep(0) // start from an empty store
-
 	c := e2eClient(srv, &tls.Config{NextProtos: []string{"http/1.1"}})
 	e2eGet(t, c, srv)
 	if n := storeLen(); n != 1 {
@@ -291,7 +291,6 @@ func TestE2E_FingerprintRemovedWhenConnectionCloses(t *testing.T) {
 // clients) must not leave an entry behind either.
 func TestE2E_FingerprintRemovedAfterBareHandshake(t *testing.T) {
 	srv := startCaddy(t, "")
-	store.sweep(0)
 
 	conn, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", srv.port),
 		&tls.Config{ServerName: "localhost", InsecureSkipVerify: true}) //nolint:gosec // self-signed test server
