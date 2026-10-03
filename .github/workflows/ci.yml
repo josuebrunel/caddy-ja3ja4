@@ -9,6 +9,8 @@ on:
 env:
   NODE_NO_WARNINGS: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Keep in sync with XCADDY_VERSION in the Makefile and Dockerfile.
+  XCADDY_VERSION: v0.4.7
 
 jobs:
   test:
@@ -45,7 +47,7 @@ jobs:
 
       - name: Build with xcaddy
         run: |
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}
           xcaddy build --with github.com/josuebrunel/caddy-ja3ja4=.
 
       - name: Verify binary
@@ -65,7 +67,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.14.0
           args: --timeout=5m
 
   vulncheck:

@@ -3,6 +3,11 @@
 BINARY := caddy
 MODULE := github.com/josuebrunel/caddy-ja3ja4
 
+# Pinned so builds and scans are reproducible. Bump deliberately; XCADDY_VERSION
+# must match the Dockerfile and the CI workflows.
+XCADDY_VERSION ?= v0.4.7
+GOVULNCHECK_VERSION ?= v1.8.0
+
 build:
 	go build -o $(BINARY) ./cmd/caddy
 
@@ -41,7 +46,7 @@ mod-check:
 	git diff --exit-code -- go.mod go.sum
 
 vulncheck:
-	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 clean:
 	rm -f $(BINARY) coverage.out

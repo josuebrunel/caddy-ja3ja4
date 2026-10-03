@@ -22,6 +22,8 @@ permissions:
 env:
   NODE_NO_WARNINGS: 1
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Keep in sync with XCADDY_VERSION in the Makefile and Dockerfile.
+  XCADDY_VERSION: v0.4.7
 
 jobs:
   # --- workflow_dispatch path: compute the new version ---
@@ -96,7 +98,7 @@ jobs:
 
       - name: Build with xcaddy
         run: |
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}
           xcaddy build --with github.com/josuebrunel/caddy-ja3ja4=.
 
       - name: Verify binary
@@ -115,18 +117,21 @@ jobs:
 
       - name: Determine tag
         id: tag
+        env:
+          NEW_TAG: ${{ needs.bump.outputs.new_tag }}
         run: |
-          # From workflow_dispatch: use computed tag
-          if [ -n "${{ needs.bump.outputs.new_tag }}" ]; then
-            echo "tag=${{ needs.bump.outputs.new_tag }}" >> $GITHUB_OUTPUT
-          # From push:tags: use the pushed tag
+          if [ -n "$NEW_TAG" ]; then
+            # From workflow_dispatch: use the computed tag
+            TAG="$NEW_TAG"
           elif [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            # From push:tags: use the pushed tag
+            TAG="${GITHUB_REF#refs/tags/}"
           else
             echo "Unable to determine tag"
             exit 1
           fi
-          echo "Using tag: ${{ steps.tag.outputs.tag }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
 
       - name: Create tag
         if: needs.bump.result == 'success'
@@ -148,7 +153,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
+          version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
