@@ -16,6 +16,9 @@ func init() {
 	httpcaddyfile.RegisterDirectiveOrder("ja3_ja4", "before", "header")
 }
 
+// matcherName is the tls.handshake_match module that records fingerprints.
+const matcherName = "ja3ja4"
+
 // JA3JA4 is a Caddy HTTP module that computes JA3 and JA4 TLS fingerprints
 // and exposes them as request placeholders.
 type JA3JA4 struct {
@@ -38,9 +41,10 @@ func (JA3JA4) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets up the module. It also injects the JA3/JA4 handshake context
-// into all TLS connection policies for the current server, and registers a
-// ConnContext callback so the underlying net.Conn is available in requests.
+// Provision sets up the module. It also installs the JA3/JA4 handshake matcher
+// in all TLS connection policies for the current server, and registers
+// ConnContext/ConnState callbacks so the underlying net.Conn is available in
+// requests and its fingerprint is dropped when it closes.
 func (m *JA3JA4) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
 
@@ -56,19 +60,23 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 		return nil
 	}
 
-	hcJSON, err := json.Marshal(map[string]any{
-		"module":              "ja3ja4",
+	matcherJSON, err := json.Marshal(map[string]any{
 		"sort_ja3_extensions": m.SortJA3Extensions,
 	})
 	if err != nil {
 		return err
 	}
 
+	// Record fingerprints from a connection-policy matcher: unlike the
+	// handshake context hook it runs for every ClientHello, including TLS 1.3
+	// resumptions that never select a certificate. Don't replace a matcher a
+	// previous handler already installed.
 	for _, cp := range srv.TLSConnPolicies {
-		// Only inject if nothing else has already claimed the handshake context
-		// slot; overwriting another module's config would silently break it.
-		if cp.HandshakeContextRaw == nil {
-			cp.HandshakeContextRaw = hcJSON
+		if cp.MatchersRaw == nil {
+			cp.MatchersRaw = make(caddy.ModuleMap)
+		}
+		if _, exists := cp.MatchersRaw[matcherName]; !exists {
+			cp.MatchersRaw[matcherName] = matcherJSON
 		}
 	}
 

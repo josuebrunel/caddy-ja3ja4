@@ -517,13 +517,15 @@ func TestJA3CurvesFiltersGREASE(t *testing.T) {
 // ServeHTTP placeholder injection
 // ---------------------------------------------------------------------------
 
-// mockConn is a minimal net.Conn for testing; only RemoteAddr is used.
+// mockConn is a minimal net.Conn for testing; only RemoteAddr and LocalAddr
+// (which JA4 reads to tell TCP from QUIC) are implemented.
 type mockConn struct {
 	net.Conn
 	remoteAddr net.Addr
 }
 
 func (m *mockConn) RemoteAddr() net.Addr { return m.remoteAddr }
+func (m *mockConn) LocalAddr() net.Addr  { return &mockAddr{s: "127.0.0.1:443"} }
 
 type mockAddr struct{ s string }
 
@@ -721,5 +723,66 @@ func TestConnStateFunc_DeletesOnClose(t *testing.T) {
 		if _, ok := store.Load(conn); ok {
 			t.Errorf("fingerprint must be removed on %v", closing)
 		}
+	}
+}
+
+type netConn struct {
+	net.Conn
+	local net.Addr
+}
+
+func (c *netConn) LocalAddr() net.Addr { return c.local }
+
+type netAddr string
+
+func (a netAddr) Network() string { return string(a) }
+func (a netAddr) String() string  { return "127.0.0.1:443" }
+
+func TestComputeJA4_TransportPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		network string
+		want    byte
+	}{
+		{"tcp", 't'},
+		{"udp", 'q'}, // QUIC sockets: Go's TLS server never speaks DTLS
+	} {
+		chi := &tls.ClientHelloInfo{
+			Conn:              &netConn{local: netAddr(tc.network)},
+			SupportedVersions: []uint16{tls.VersionTLS13},
+			CipherSuites:      []uint16{0x1301},
+			Extensions:        []uint16{0, 43},
+		}
+		if got := computeJA4(chi); got[0] != tc.want {
+			t.Errorf("network %q: JA4 %q starts with %q, want %q", tc.network, got, got[0], tc.want)
+		}
+		if chi.Conn.LocalAddr().Network() != tc.network {
+			t.Errorf("computeJA4 must not modify the caller's ClientHelloInfo")
+		}
+	}
+}
+
+func TestHandshakeMatcher_RecordsAndAlwaysMatches(t *testing.T) {
+	m := &HandshakeMatcher{}
+	if !m.Match(nil) {
+		t.Error("Match(nil) must still report true so it never changes policy selection")
+	}
+	if !m.Match(&tls.ClientHelloInfo{}) {
+		t.Error("Match without a connection must report true")
+	}
+
+	conn := &mockConn{remoteAddr: &mockAddr{s: "198.51.100.7:5555"}}
+	t.Cleanup(func() { store.Delete(conn) })
+	chi := &tls.ClientHelloInfo{
+		Conn:              conn,
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		CipherSuites:      []uint16{0x1301},
+		Extensions:        []uint16{0, 43},
+	}
+	if !m.Match(chi) {
+		t.Fatal("Match must report true")
+	}
+	fp, ok := store.Load(conn)
+	if !ok || len(fp.JA3) != 32 || fp.JA4 == "" {
+		t.Errorf("matcher did not record the fingerprint: %+v ok=%v", fp, ok)
 	}
 }

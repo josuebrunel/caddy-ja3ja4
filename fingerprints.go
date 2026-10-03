@@ -208,8 +208,35 @@ func computeJA4(chi *tls.ClientHelloInfo) string {
 	if chi == nil {
 		return "n/a"
 	}
-	return ja4plus.JA4(chi)
+	return ja4plus.JA4(quicAware(chi))
 }
+
+// quicAware returns chi unchanged unless it came in over a UDP-based
+// transport, in which case it returns a copy whose connection reports the
+// "quic" network. ja4plus labels a "udp" connection as DTLS ('d'), but Go's
+// crypto/tls cannot serve DTLS, so a handshake on a UDP socket here is always
+// QUIC (HTTP/3), which JA4 labels 'q'.
+func quicAware(chi *tls.ClientHelloInfo) *tls.ClientHelloInfo {
+	if chi.Conn == nil {
+		return chi
+	}
+	local := chi.Conn.LocalAddr()
+	if local == nil || local.Network() != "udp" {
+		return chi
+	}
+	c := *chi
+	c.Conn = quicConn{chi.Conn}
+	return &c
+}
+
+// quicConn reports its local address as belonging to the "quic" network.
+type quicConn struct{ net.Conn }
+
+func (c quicConn) LocalAddr() net.Addr { return quicAddr{c.Conn.LocalAddr()} }
+
+type quicAddr struct{ net.Addr }
+
+func (quicAddr) Network() string { return "quic" }
 
 // extSupportedVersions is the TLS extension ID of supported_versions (RFC 8446).
 const extSupportedVersions = 43

@@ -14,6 +14,63 @@ import (
 
 func init() {
 	caddy.RegisterModule(HandshakeContextModule{})
+	caddy.RegisterModule(HandshakeMatcher{})
+}
+
+// HandshakeMatcher is a tls.handshake_match module that records the JA3/JA4
+// fingerprint of every ClientHello and always matches.
+//
+// Caddy evaluates connection-policy matchers for every ClientHello, including
+// TLS 1.3 session resumptions. The HandshakeContext hook, by contrast, only
+// runs while a certificate is being selected, which resumed handshakes skip,
+// so relying on it left resumed connections without a fingerprint (or with a
+// stale one left by an earlier connection from the same address). Recording in
+// a matcher also covers HTTP/3, where quic-go sets hello.Conn before the
+// policies run.
+//
+// The matcher has no effect on policy selection. Caddy may call it once per
+// policy it tries for a handshake; every call records the same value.
+type HandshakeMatcher struct {
+	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
+
+	logger *zap.Logger
+}
+
+// CaddyModule returns module info.
+func (HandshakeMatcher) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "tls.handshake_match.ja3ja4",
+		New: func() caddy.Module { return new(HandshakeMatcher) },
+	}
+}
+
+// Provision sets up the module.
+func (m *HandshakeMatcher) Provision(ctx caddy.Context) error {
+	m.logger = ctx.Logger(m)
+	return nil
+}
+
+// Match records the fingerprint of hello and reports true.
+func (m *HandshakeMatcher) Match(hello *tls.ClientHelloInfo) bool {
+	recordFingerprint(hello, m.SortJA3Extensions, m.logger)
+	return true
+}
+
+// recordFingerprint computes the fingerprints for hello and stores them in the
+// global store, keyed by the connection. It returns the fingerprint and whether
+// one was computed (false when hello or its connection is missing).
+func recordFingerprint(hello *tls.ClientHelloInfo, sortExtensions bool, logger *zap.Logger) (TLSFingerprint, bool) {
+	if hello == nil || hello.Conn == nil {
+		return TLSFingerprint{}, false
+	}
+
+	ja3Raw, ja3, ja4 := computeFingerprints(hello, sortExtensions)
+	fp := TLSFingerprint{JA3: ja3, JA3Raw: ja3Raw, JA4: ja4}
+
+	if !store.Store(hello.Conn, fp) {
+		warnStoreFull(logger)
+	}
+	return fp, true
 }
 
 // HandshakeContextModule implements caddytls.HandshakeContext to compute
@@ -69,30 +126,17 @@ func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (c
 	if hello == nil {
 		return context.Background(), nil
 	}
-	if hello.Conn == nil {
+	fp, ok := recordFingerprint(hello, m.SortJA3Extensions, m.logger)
+	if !ok {
 		return hello.Context(), nil
 	}
-
-	ja3Raw, ja3, ja4 := computeFingerprints(hello, m.SortJA3Extensions)
-
-	fp := TLSFingerprint{
-		JA3:    ja3,
-		JA3Raw: ja3Raw,
-		JA4:    ja4,
-	}
-
-	if !store.Store(hello.Conn, fp) {
-		m.warnStoreFull()
-	}
-
-	ctx := context.WithValue(hello.Context(), fpCtxKey{}, fp)
-	return ctx, nil
+	return context.WithValue(hello.Context(), fpCtxKey{}, fp), nil
 }
 
 // warnStoreFull logs that a fingerprint was dropped because the store is full,
 // at most once a minute so a flood cannot also flood the log.
-func (m *HandshakeContextModule) warnStoreFull() {
-	if m.logger == nil {
+func warnStoreFull(logger *zap.Logger) {
+	if logger == nil {
 		return
 	}
 	now := time.Now().UnixNano()
@@ -100,14 +144,16 @@ func (m *HandshakeContextModule) warnStoreFull() {
 	if now-last < int64(time.Minute) || !lastStoreFullWarn.CompareAndSwap(last, now) {
 		return
 	}
-	m.logger.Warn("fingerprint store is full; dropping fingerprints for new connections",
+	logger.Warn("fingerprint store is full; dropping fingerprints for new connections",
 		zap.Int("max_entries", defaultMaxEntries))
 }
 
 // Interface compliance.
 var (
-	_ caddy.Module              = (*HandshakeContextModule)(nil)
-	_ caddy.Provisioner         = (*HandshakeContextModule)(nil)
-	_ caddytls.HandshakeContext = (*HandshakeContextModule)(nil)
-	_ caddyfile.Unmarshaler     = (*HandshakeContextModule)(nil)
+	_ caddy.Module               = (*HandshakeContextModule)(nil)
+	_ caddy.Provisioner          = (*HandshakeContextModule)(nil)
+	_ caddytls.HandshakeContext  = (*HandshakeContextModule)(nil)
+	_ caddytls.ConnectionMatcher = (*HandshakeMatcher)(nil)
+	_ caddy.Provisioner          = (*HandshakeMatcher)(nil)
+	_ caddyfile.Unmarshaler      = (*HandshakeContextModule)(nil)
 )
