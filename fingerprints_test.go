@@ -668,3 +668,58 @@ func TestComputeJA3_GREASEVersionIsStable(t *testing.T) {
 		t.Errorf("expected JA3 to start with 771, got %q", rawA)
 	}
 }
+
+func TestFingerprintStore_CapDropsNewEntries(t *testing.T) {
+	s := NewFingerprintStore()
+	s.max = 2
+
+	c1 := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.1:1"}}
+	c2 := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.1:2"}}
+	c3 := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.1:3"}}
+
+	if !s.Store(c1, TLSFingerprint{JA3: "one"}) || !s.Store(c2, TLSFingerprint{JA3: "two"}) {
+		t.Fatal("entries below the cap must be stored")
+	}
+	if s.Store(c3, TLSFingerprint{JA3: "three"}) {
+		t.Error("a new entry beyond the cap must be dropped")
+	}
+	if _, ok := s.Load(c3); ok {
+		t.Error("dropped entry must not be loadable")
+	}
+	if fp, ok := s.Load(c1); !ok || fp.JA3 != "one" {
+		t.Error("existing entries must survive a full store")
+	}
+
+	// Replacing an already-known connection is always allowed.
+	if !s.Store(c1, TLSFingerprint{JA3: "one-v2"}) {
+		t.Error("replacing an existing entry must succeed when full")
+	}
+	if fp, _ := s.Load(c1); fp.JA3 != "one-v2" {
+		t.Errorf("expected replaced entry, got %q", fp.JA3)
+	}
+
+	// Freeing a slot makes room again.
+	s.Delete(c2)
+	if !s.Store(c3, TLSFingerprint{JA3: "three"}) {
+		t.Error("store must accept entries again after one is deleted")
+	}
+}
+
+func TestConnStateFunc_DeletesOnClose(t *testing.T) {
+	for _, closing := range []http.ConnState{http.StateClosed, http.StateHijacked} {
+		conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.1:4000"}}
+		store.Store(conn, TLSFingerprint{JA3: "x"})
+
+		for _, live := range []http.ConnState{http.StateNew, http.StateActive, http.StateIdle} {
+			connStateFunc(conn, live)
+			if _, ok := store.Load(conn); !ok {
+				t.Fatalf("fingerprint must survive state %v", live)
+			}
+		}
+
+		connStateFunc(conn, closing)
+		if _, ok := store.Load(conn); ok {
+			t.Errorf("fingerprint must be removed on %v", closing)
+		}
+	}
+}

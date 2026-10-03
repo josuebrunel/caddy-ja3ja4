@@ -25,6 +25,10 @@ const (
 	fingerprintTTL = 5 * time.Minute
 	// sweepInterval is how often the background sweeper scans for expired entries.
 	sweepInterval = 1 * time.Minute
+	// defaultMaxEntries bounds the store so a flood of handshakes cannot grow
+	// it without limit. Entries are normally removed as soon as their
+	// connection closes, so this is only reached under abuse.
+	defaultMaxEntries = 100_000
 )
 
 // fingerprintEntry pairs a fingerprint with a last-seen timestamp (unix nano)
@@ -37,29 +41,38 @@ type fingerprintEntry struct {
 
 // FingerprintStore is a thread-safe store for TLS fingerprints keyed by connection.
 type FingerprintStore struct {
-	mu sync.RWMutex
-	m  map[string]*fingerprintEntry
+	mu  sync.RWMutex
+	m   map[string]*fingerprintEntry
+	max int
 }
 
 // NewFingerprintStore creates a new fingerprint store.
 func NewFingerprintStore() *FingerprintStore {
 	return &FingerprintStore{
-		m: make(map[string]*fingerprintEntry),
+		m:   make(map[string]*fingerprintEntry),
+		max: defaultMaxEntries,
 	}
 }
 
-// Store saves a fingerprint for the given connection.
-func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) {
+// Store saves a fingerprint for the given connection. It reports whether the
+// fingerprint was kept: a new entry is dropped when the store is full, so that
+// a handshake flood cannot evict fingerprints of live connections. Replacing
+// the entry of an already-known connection always succeeds.
+func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 	key := connKey(conn)
 	if key == "" {
-		return
+		return false
 	}
 	e := &fingerprintEntry{fp: fp}
 	e.lastSeen.Store(time.Now().UnixNano())
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.m[key]; !exists && len(s.m) >= s.max {
+		return false
+	}
 	s.m[key] = e
+	return true
 }
 
 // Load retrieves the fingerprint for the given connection.

@@ -62,6 +62,19 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	return next.ServeHTTP(w, r)
 }
 
+// connStateFunc is registered via Server.RegisterConnState during Provision.
+// It drops a connection's fingerprint as soon as the connection ends, so the
+// store holds roughly one entry per live connection instead of one per
+// handshake seen in the last TTL window. net/http reports StateClosed for
+// every connection, including ones whose TLS handshake failed, which is why
+// this (and not a context callback, see connContextFunc) is the cleanup hook.
+func connStateFunc(c net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateClosed, http.StateHijacked:
+		store.Delete(c)
+	}
+}
+
 // connContextFunc is registered via Server.RegisterConnContext during
 // Provision. It stores the net.Conn in the request context so that
 // ServeHTTP can look up the associated fingerprint.
@@ -74,11 +87,12 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 // the store, causing {tls.ja3} / {tls.ja4} placeholders to appear
 // unsubstituted on subsequent requests on the same keep-alive connection.
 //
-// Instead, the global FingerprintStore uses a sliding TTL: every lookup
-// refreshes the entry's last-seen timestamp, and a background sweeper
-// (started in JA3JA4.Provision via FingerprintStore.StartSweeper) reclaims
-// entries that go unused past that TTL. This bounds memory usage without
-// ever evicting a fingerprint that's still actively in use.
+// Entries are removed by connStateFunc when the connection closes. As a
+// safety net (notably for HTTP/3, which has no ConnState), the global
+// FingerprintStore also uses a sliding TTL: every lookup refreshes the
+// entry's last-seen timestamp, and a background sweeper (started in
+// JA3JA4.Provision via FingerprintStore.StartSweeper) reclaims entries that go
+// unused past that TTL, without ever evicting one that's still in use.
 func connContextFunc(ctx context.Context, c net.Conn) context.Context {
 	return context.WithValue(ctx, connCtxKey{}, c)
 }

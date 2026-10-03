@@ -3,10 +3,13 @@ package ja3ja4
 import (
 	"context"
 	"crypto/tls"
+	"sync/atomic"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -17,7 +20,13 @@ func init() {
 // JA3/JA4 fingerprints during the TLS handshake.
 type HandshakeContextModule struct {
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
+
+	logger *zap.Logger
 }
+
+// lastStoreFullWarn is the unix-nano time of the last "store full" warning.
+// It is package-level because the store it describes is global.
+var lastStoreFullWarn atomic.Int64
 
 // CaddyModule returns module info.
 func (HandshakeContextModule) CaddyModule() caddy.ModuleInfo {
@@ -28,7 +37,8 @@ func (HandshakeContextModule) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision sets up the module.
-func (m *HandshakeContextModule) Provision(_ caddy.Context) error {
+func (m *HandshakeContextModule) Provision(ctx caddy.Context) error {
+	m.logger = ctx.Logger(m)
 	return nil
 }
 
@@ -71,10 +81,27 @@ func (m *HandshakeContextModule) HandshakeContext(hello *tls.ClientHelloInfo) (c
 		JA4:    ja4,
 	}
 
-	store.Store(hello.Conn, fp)
+	if !store.Store(hello.Conn, fp) {
+		m.warnStoreFull()
+	}
 
 	ctx := context.WithValue(hello.Context(), fpCtxKey{}, fp)
 	return ctx, nil
+}
+
+// warnStoreFull logs that a fingerprint was dropped because the store is full,
+// at most once a minute so a flood cannot also flood the log.
+func (m *HandshakeContextModule) warnStoreFull() {
+	if m.logger == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := lastStoreFullWarn.Load()
+	if now-last < int64(time.Minute) || !lastStoreFullWarn.CompareAndSwap(last, now) {
+		return
+	}
+	m.logger.Warn("fingerprint store is full; dropping fingerprints for new connections",
+		zap.Int("max_entries", defaultMaxEntries))
 }
 
 // Interface compliance.
