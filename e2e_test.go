@@ -654,3 +654,31 @@ func TestE2E_JA3MatchesWireClientHello(t *testing.T) {
 		})
 	}
 }
+
+func TestE2E_HooksRegisteredOncePerServer(t *testing.T) {
+	hooks.mu.Lock()
+	before := hooks.registrations
+	hooks.mu.Unlock()
+
+	startCaddy(t, `
+		ja3_ja4
+		ja3_ja4
+		ja3_ja4
+		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`)
+
+	hooks.mu.Lock()
+	got, tracked := hooks.registrations-before, len(hooks.refs)
+	hooks.mu.Unlock()
+	if got != 1 {
+		t.Errorf("3 handlers registered the server hooks %d times, want 1", got)
+	}
+
+	if err := caddy.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	hooks.mu.Lock()
+	defer hooks.mu.Unlock()
+	if len(hooks.refs) >= tracked {
+		t.Errorf("server still tracked after unloading the config (%d -> %d)", tracked, len(hooks.refs))
+	}
+}

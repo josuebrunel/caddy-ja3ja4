@@ -1215,3 +1215,31 @@ func TestComputeJA4_ChromeReferenceSegments(t *testing.T) {
 		t.Errorf("JA4 cipher hash = %q, want 8daaf6152771", parts[1])
 	}
 }
+
+func TestServerHooks_RegisteredOncePerServer(t *testing.T) {
+	h := &serverHooks{refs: make(map[*caddyhttp.Server]int)}
+	a, b := new(caddyhttp.Server), new(caddyhttp.Server)
+
+	h.acquire(a)
+	h.acquire(a)
+	h.acquire(a)
+	if h.registrations != 1 {
+		t.Fatalf("3 handlers on one server registered the hooks %d times, want 1", h.registrations)
+	}
+	h.acquire(b)
+	if h.registrations != 2 {
+		t.Errorf("a second server must get its own hooks, registrations = %d", h.registrations)
+	}
+
+	h.release(a)
+	h.release(a)
+	if len(h.refs) != 2 {
+		t.Errorf("server forgotten while a handler still uses it: %d tracked", len(h.refs))
+	}
+	h.release(a)
+	h.release(b)
+	if len(h.refs) != 0 {
+		t.Errorf("servers leaked after all handlers were cleaned up: %d tracked", len(h.refs))
+	}
+	h.release(a) // unbalanced release must be harmless
+}

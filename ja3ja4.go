@@ -2,6 +2,7 @@ package ja3ja4
 
 import (
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -16,6 +17,43 @@ func init() {
 	caddy.RegisterModule(JA3JA4{})
 	httpcaddyfile.RegisterHandlerDirective("ja3_ja4", parseCaddyfile)
 	httpcaddyfile.RegisterDirectiveOrder("ja3_ja4", "before", "header")
+}
+
+// serverHooks makes sure the ConnContext/ConnState callbacks are registered
+// once per server, however many ja3_ja4 handlers it has. Without it every
+// handler instance would append its own copy, and each connection would run N
+// identical callbacks.
+type serverHooks struct {
+	mu            sync.Mutex
+	refs          map[*caddyhttp.Server]int
+	registrations int // how many times hooks were really registered (for tests)
+}
+
+var hooks = &serverHooks{refs: make(map[*caddyhttp.Server]int)}
+
+// acquire registers the hooks on srv the first time it is called for it.
+func (h *serverHooks) acquire(srv *caddyhttp.Server) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.refs[srv] == 0 {
+		srv.RegisterConnContext(connContextFunc)
+		srv.RegisterConnState(connStateFunc)
+		h.registrations++
+	}
+	h.refs[srv]++
+}
+
+// release forgets srv once its last handler is cleaned up, so reloaded configs
+// (which build new Server values) don't accumulate stale entries. Caddy has no
+// way to unregister the callbacks; they die with the old Server.
+func (h *serverHooks) release(srv *caddyhttp.Server) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.refs[srv] <= 1 {
+		delete(h.refs, srv)
+		return
+	}
+	h.refs[srv]--
 }
 
 // matcherName is the tls.handshake_match module that records fingerprints.
@@ -33,7 +71,8 @@ type JA3JA4 struct {
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
 	logger   *zap.Logger
-	sweeping bool // whether Provision acquired the shared sweeper
+	sweeping bool              // whether Provision acquired the shared sweeper
+	srv      *caddyhttp.Server // server whose hooks Provision acquired
 }
 
 // CaddyModule returns module info.
@@ -67,8 +106,8 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 		return err
 	}
 
-	srv.RegisterConnContext(connContextFunc)
-	srv.RegisterConnState(connStateFunc)
+	hooks.acquire(srv)
+	m.srv = srv
 
 	store.EnsureTTL(ttlForIdleTimeout(time.Duration(srv.IdleTimeout)))
 	store.AcquireSweeper()
@@ -120,9 +159,13 @@ func installMatcher(policies caddytls.ConnectionPolicies, sortExtensions bool, l
 	return nil
 }
 
-// Cleanup releases the shared background sweeper; it stops once the last
-// handler instance is cleaned up.
+// Cleanup releases the server hooks and the shared background sweeper; the
+// sweeper stops once the last handler instance is cleaned up.
 func (m *JA3JA4) Cleanup() error {
+	if m.srv != nil {
+		hooks.release(m.srv)
+		m.srv = nil
+	}
 	if m.sweeping {
 		m.sweeping = false
 		store.ReleaseSweeper()
