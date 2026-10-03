@@ -923,6 +923,16 @@ func TestInstallMatcher(t *testing.T) {
 		}
 	})
 
+	t.Run("warns when the server has no TLS policies", func(t *testing.T) {
+		core, logs := observer.New(zap.WarnLevel)
+		if err := installMatcher(nil, false, zap.New(core)); err != nil {
+			t.Fatal(err)
+		}
+		if logs.Len() != 1 {
+			t.Errorf("expected one warning for a server without TLS, got %d", logs.Len())
+		}
+	})
+
 	t.Run("same setting is silent", func(t *testing.T) {
 		cps := newPolicies()
 		core, logs := observer.New(zap.WarnLevel)

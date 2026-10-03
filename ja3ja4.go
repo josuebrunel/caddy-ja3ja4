@@ -87,6 +87,12 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 // server-wide, and a later handler asking for a different one gets a warning.
 // {tls.ja3_sorted} always reports what was really used.
 func installMatcher(policies caddytls.ConnectionPolicies, sortExtensions bool, logger *zap.Logger) error {
+	if len(policies) == 0 {
+		logger.Warn("this server has no TLS connection policies (plain HTTP?); " +
+			"ja3_ja4 has no handshake to fingerprint, so {tls.ja3} and {tls.ja4} will be empty")
+		return nil
+	}
+
 	matcherJSON, err := json.Marshal(HandshakeMatcher{SortJA3Extensions: sortExtensions})
 	if err != nil {
 		return err
