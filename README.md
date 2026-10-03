@@ -276,53 +276,58 @@ The fingerprints reach the log through `log_append` lines in `Caddyfile.test`, a
 
 1. **Provision Phase**: When a `ja3_ja4` handler is provisioned, it:
    - Gets the current `*caddyhttp.Server` from context
-   - Adds a `tls.handshake_match.ja3ja4` matcher to every TLS connection policy of that server (it always records the wire-order fingerprint; see `sort_ja3_extensions`)
+   - Adds a `tls.handshake_match.ja3ja4` matcher to every TLS connection policy of that server
    - Registers `ConnContext` and `ConnState` callbacks, once per server
-   - Joins the shared background sweeper and sizes the store TTL from the server's idle timeout
+   - Joins the shared background sweeper, sizes the store TTL from the server's idle timeout, and raises the store capacity if `max_entries` asks for more
 
 2. **TLS Handshake Phase**: For every ClientHello, including resumed TLS 1.3 sessions and QUIC handshakes, Caddy evaluates the connection policies' matchers:
-   - The matcher computes JA3 in pure Go and JA4 through `github.com/exaring/ja4plus`
+   - The matcher computes JA3 in pure Go (always in wire order) and JA4 through `github.com/exaring/ja4plus`
    - The result is stored in a sharded, lock-protected map keyed by the connection's transport (TCP or QUIC) and remote address
    - The matcher always returns true, so it never changes which policy is selected
 
 3. **HTTP Request Phase**: When the request reaches the handler:
    - The `net.Conn` is taken from the request context (set by `ConnContext`), or the request's remote address is used for HTTP/3
-   - The fingerprint is looked up in the store
+   - The fingerprint is looked up in the store; a handler with `sort_ja3_extensions` derives the sorted JA3 from it (once per connection, then cached)
    - Placeholders are set on the replacer: `{tls.ja3}`, `{tls.ja4}`, etc. (empty if nothing was found)
 
-4. **Cleanup**: When Caddy reports the connection closed (or hijacked), `ConnState` deletes its entry.
+4. **Cleanup**:
+   - **TCP**: when Caddy reports the connection closed (or hijacked), `ConnState` deletes its entry.
+   - **QUIC**: there is no close event to hook, so the sweeper expires entries instead: one minute after the handshake if no request ever used it, otherwise once it has been idle for the server's idle timeout plus a minute.
 
 ### Why This Design?
 
 - **A matcher, not the handshake context**: Caddy's `HandshakeContext` hook only runs while a certificate is being selected, which resumed TLS 1.3 sessions skip. Connection-policy matchers run for every ClientHello. (`tls.context.ja3ja4` is still registered so existing JSON configs that reference it keep working, but the handler no longer installs it.)
 - **Per-connection, not per-module**: Fingerprints are keyed by connection, not tied to a single handler instance
-- **Bounded memory**: Entries are removed when their connection closes, the store holds at most 100,000 entries (new ones are dropped, with a rate-limited warning, once it is full), and a sweeper drops entries unused for the server's idle timeout plus a minute. Every lookup, and every transition to idle, refreshes an entry, so live keep-alive connections are never evicted
+- **Wire order in the store, sorting at the edge**: Sorting only reorders three fields of the JA3 string, so the store keeps one variant and each handler derives the one it wants. That is what makes `sort_ja3_extensions` a per-handler setting even though the TLS layer is shared by every site on a port
+- **Bounded memory**: Entries are removed when their TCP connection closes, QUIC entries expire as described above, and the store holds at most `max_entries` entries (100,000 by default; new ones are dropped, with a rate-limited warning, once it is full). QUIC may use at most half of that, so a flood of QUIC handshakes can't leave TCP clients without a fingerprint. Every lookup, and every transition to idle, refreshes an entry, so live keep-alive connections are never evicted
 - **No global lock**: The store is split into 32 shards, so handshakes, request lookups and the sweeper rarely contend
 
 ## Known Limitations
 
-### Fingerprinting is per server
+### Every handshake on the server is fingerprinted
 
-The matcher is installed in every TLS connection policy of a Caddy server, i.e. every site sharing a listening port, as soon as one of them uses `ja3_ja4`. Handlers can't be tied to individual policies, because a policy is chosen from the ClientHello before any route runs. So every handshake on that server is fingerprinted, including those of sites that don't use `ja3_ja4` (about 4 microseconds each). `sort_ja3_extensions` is not affected: it is a per-handler setting, because the store keeps the wire-order fingerprint and a handler that sorts derives its variant from it.
+The matcher is installed in every TLS connection policy of a Caddy server, i.e. every site sharing a listening port, as soon as one of them uses `ja3_ja4`. Handlers can't be tied to individual policies, because a policy is chosen from the ClientHello before any route runs. So the handshakes of sites that don't use `ja3_ja4` are fingerprinted too (about 4 microseconds each). Only the placeholders and `sort_ja3_extensions` are per handler.
 
-### HTTP/3 entries age out instead of being deleted
+### HTTP/3 connections are expired, not deleted
 
-`ConnState` only exists for TCP connections, so QUIC connections' entries are removed by the sweeper once they've been unused for the idle timeout plus a minute, not at connection close.
+Caddy gives modules a hook for TCP connections closing but has none for QUIC (tracked in [#41](https://github.com/josuebrunel/caddy-ja3ja4/issues/41)). Until it does, QUIC entries are removed by the sweeper, which has three consequences:
+
+- **A QUIC connection whose first request comes more than a minute after its handshake has no fingerprint.** Placeholders are empty for it. This can happen with a browser's speculative preconnect; an HTTP/3 client that connects to send a request does so within moments.
+- **Closed QUIC connections' entries linger** until they expire (up to the idle timeout plus a minute), so how many fit depends on how many new HTTP/3 connections arrive per second.
+- **Unanswered handshakes create entries.** quic-go processes a QUIC Initial's ClientHello before the client's address is verified, and Caddy only demands verification above 1000 handshakes per second, so spoofed-source packets can create entries. They are bounded by the QUIC share of the store and expire after a minute, and TCP connections always keep at least half of the store's capacity.
 
 ### The store is capped
 
-If more than 100,000 connections are tracked at once (or a flood of handshakes arrives faster than they close), fingerprints for new connections are dropped until space frees up, and their placeholders are empty.
+At most `max_entries` connections are tracked at once (100,000 by default), and QUIC may use half of that. Beyond that, fingerprints for new connections are dropped until space frees up, their placeholders are empty, and a warning naming the budget that is full is logged at most once a minute.
 
-### GREASE Filtering
+## Compatibility Notes
 
-GREASE values (RFC 8701: `0x?A?A` pattern) are filtered from the version,
-cipher suites, extensions, and elliptic curves before hashing, matching the canonical JA3
-specification. If you compare against fingerprints generated by a tool that does
-*not* filter GREASE, the hashes will differ.
+These are behaviours worth knowing about when comparing with other tools, not shortcomings.
 
-### JA3 Version Field
-
-Go's `crypto/tls` doesn't expose the raw `client_version` field. The module reconstructs it: `771` (`0x0303`) whenever the client sent the `supported_versions` extension, which RFC 8446 requires, and otherwise the first non-GREASE version Go reports. For compliant clients this matches what Wireshark/tshark and other reference tools produce.
+- **GREASE filtering.** GREASE values (RFC 8701: `0x?A?A` pattern) are filtered from the version, cipher suites, extensions and elliptic curves before hashing, as the JA3 specification requires. If you compare against fingerprints generated by a tool that does *not* filter GREASE, the hashes will differ.
+- **JA3 version field.** Go's `crypto/tls` doesn't expose the raw `client_version` field, so the module reconstructs it: `771` (`0x0303`) whenever the client sent the `supported_versions` extension, which RFC 8446 requires, and otherwise the first non-GREASE version Go reports. For compliant clients this matches Wireshark/tshark and other reference tools.
+- **JA4 transport.** The JA4 starts with `t` for TCP and `q` for QUIC (HTTP/3).
+- **`sort_ja3_extensions` is a handler setting.** The `sort_ja3_extensions` field of the `tls.handshake_match.ja3ja4` and `tls.context.ja3ja4` modules is deprecated and ignored. If a JSON config set it there, set it on the `ja3_ja4` handler instead, or `{tls.ja3}` will now be the wire-order hash.
 
 ## Security Considerations
 
