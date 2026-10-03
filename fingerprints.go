@@ -67,7 +67,7 @@ type FingerprintStore struct {
 	shards [shardCount]storeShard
 	size   atomic.Int64 // entries across all shards, enforced against max
 	udp    atomic.Int64 // the QUIC share of size, enforced against max/2
-	max    int
+	max    atomic.Int64 // capacity; see EnsureMax
 	ttl    atomic.Int64 // time.Duration; see EnsureTTL
 
 	sweepMu     sync.Mutex
@@ -78,7 +78,8 @@ type FingerprintStore struct {
 
 // NewFingerprintStore creates a new fingerprint store.
 func NewFingerprintStore() *FingerprintStore {
-	s := &FingerprintStore{max: defaultMaxEntries}
+	s := &FingerprintStore{}
+	s.max.Store(defaultMaxEntries)
 	for i := range s.shards {
 		s.shards[i].m = make(map[string]*fingerprintEntry)
 	}
@@ -124,6 +125,23 @@ func (s *FingerprintStore) EnsureTTL(d time.Duration) {
 	}
 }
 
+// EnsureMax raises the capacity to at least n entries. Like EnsureTTL it only
+// grows: the store is shared by every server in the process, so it fits the
+// largest value any handler asks for.
+func (s *FingerprintStore) EnsureMax(n int) {
+	for {
+		cur := s.max.Load()
+		if int64(n) <= cur || s.max.CompareAndSwap(cur, int64(n)) {
+			return
+		}
+	}
+}
+
+// Max returns the capacity of the store.
+func (s *FingerprintStore) Max() int {
+	return int(s.max.Load())
+}
+
 // TTL returns how long an unused entry is kept.
 func (s *FingerprintStore) TTL() time.Duration {
 	return time.Duration(s.ttl.Load())
@@ -167,7 +185,7 @@ func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 		// The caps are checked against store-wide counts, so they can be
 		// overshot by a few entries when shards race; they are safety bounds,
 		// not exact quotas.
-		if s.size.Load() >= int64(s.max) {
+		if s.size.Load() >= s.max.Load() {
 			return false
 		}
 		// QUIC entries get only half of the capacity. A TCP entry is removed
@@ -189,7 +207,7 @@ func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 
 // quicBudget is how many entries QUIC connections may hold at once.
 func (s *FingerprintStore) quicBudget() int64 {
-	return int64(s.max) / 2
+	return s.max.Load() / 2
 }
 
 // isQUICKey reports whether a store key belongs to a QUIC connection.

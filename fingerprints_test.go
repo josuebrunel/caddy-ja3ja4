@@ -649,7 +649,7 @@ func TestComputeJA3_GREASEVersionIsStable(t *testing.T) {
 
 func TestFingerprintStore_CapDropsNewEntries(t *testing.T) {
 	s := NewFingerprintStore()
-	s.max = 2
+	s.max.Store(2)
 
 	c1 := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.1:1"}}
 	c2 := &mockConn{remoteAddr: &mockAddr{s: "10.0.0.1:2"}}
@@ -1227,28 +1227,85 @@ func TestServerHooks_RegisteredOncePerServer(t *testing.T) {
 	h.release(a) // unbalanced release must be harmless
 }
 
-func TestParseSortOption(t *testing.T) {
+func TestParseOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		input   string
-		want    bool
-		wantErr bool
+		want    options
+		wantErr string // substring; empty means no error
 	}{
-		{"bare directive", `ja3_ja4`, false, false},
-		{"empty block", "ja3_ja4 {\n}", false, false},
-		{"flag", "ja3_ja4 {\n\tsort_ja3_extensions\n}", true, false},
-		{"flag with an argument", "ja3_ja4 {\n\tsort_ja3_extensions yes\n}", false, true},
-		{"unknown subdirective", "ja3_ja4 {\n\tnope\n}", false, true},
+		{"bare directive", `ja3_ja4`, options{}, ""},
+		{"empty block", "ja3_ja4 {\n}", options{}, ""},
+		{"sort flag", "ja3_ja4 {\n\tsort_ja3_extensions\n}", options{sortExtensions: true}, ""},
+		{"max_entries", "ja3_ja4 {\n\tmax_entries 5000\n}", options{maxEntries: 5000}, ""},
+		{"both", "ja3_ja4 {\n\tmax_entries 42\n\tsort_ja3_extensions\n}", options{sortExtensions: true, maxEntries: 42}, ""},
+		{"flag with an argument", "ja3_ja4 {\n\tsort_ja3_extensions yes\n}", options{}, "wrong argument count"},
+		{"unknown subdirective", "ja3_ja4 {\n\tnope\n}", options{}, "unrecognized subdirective"},
+		{"max_entries without a value", "ja3_ja4 {\n\tmax_entries\n}", options{}, "wrong argument count"},
+		{"max_entries zero", "ja3_ja4 {\n\tmax_entries 0\n}", options{}, "positive integer"},
+		{"max_entries negative", "ja3_ja4 {\n\tmax_entries -5\n}", options{}, "positive integer"},
+		{"max_entries not a number", "ja3_ja4 {\n\tmax_entries lots\n}", options{}, "positive integer"},
+		{"max_entries with extra argument", "ja3_ja4 {\n\tmax_entries 10 20\n}", options{}, "wrong argument count"},
+		{"max_entries twice", "ja3_ja4 {\n\tmax_entries 10\n\tmax_entries 20\n}", options{}, "more than once"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseSortOption(caddyfile.NewTestDispenser(tc.input))
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			got, err := parseOptions(caddyfile.NewTestDispenser(tc.input))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("options = %+v, want %+v", got, tc.want)
+				}
+				return
 			}
-			if got != tc.want {
-				t.Errorf("sort = %v, want %v", got, tc.want)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want one containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestJA3JA4_ValidateMaxEntries(t *testing.T) {
+	for _, tc := range []struct {
+		n       int
+		wantErr bool
+	}{{0, false}, {1, false}, {250_000, false}, {-1, true}} {
+		err := (&JA3JA4{MaxEntries: tc.n}).Validate()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("MaxEntries %d: err = %v, wantErr %v", tc.n, err, tc.wantErr)
+		}
+	}
+}
+
+func TestHandshakeContextModule_RejectsMaxEntries(t *testing.T) {
+	m := &HandshakeContextModule{}
+	err := m.UnmarshalCaddyfile(caddyfile.NewTestDispenser("ja3ja4 {\n\tmax_entries 10\n}"))
+	if err == nil {
+		t.Error("max_entries belongs to the handler; the TLS context module must reject it")
+	}
+}
+
+// Like the TTL, the shared store only grows to fit the largest request.
+func TestFingerprintStore_EnsureMaxOnlyGrows(t *testing.T) {
+	s := NewFingerprintStore()
+	if s.Max() != defaultMaxEntries {
+		t.Fatalf("default capacity = %d, want %d", s.Max(), defaultMaxEntries)
+	}
+	s.EnsureMax(10)
+	if s.Max() != defaultMaxEntries {
+		t.Errorf("a smaller value must not shrink the store: %d", s.Max())
+	}
+	s.EnsureMax(250_000)
+	if s.Max() != 250_000 {
+		t.Errorf("capacity = %d, want 250000", s.Max())
+	}
+	s.EnsureMax(150_000)
+	if s.Max() != 250_000 {
+		t.Errorf("two handlers: the larger value must win, got %d", s.Max())
+	}
+	if s.quicBudget() != 125_000 {
+		t.Errorf("QUIC budget = %d, want half of the capacity", s.quicBudget())
 	}
 }
 
@@ -1455,7 +1512,7 @@ func quicAddrConn(i int) *addrConn {
 // room however many QUIC handshakes arrive.
 func TestFingerprintStore_QUICHasItsOwnBudget(t *testing.T) {
 	s := NewFingerprintStore()
-	s.max = 10 // QUIC budget: 5
+	s.max.Store(10) // QUIC budget: 5
 
 	quic := make([]*addrConn, 8)
 	stored := 0
@@ -1532,9 +1589,9 @@ func TestFingerprintStore_QUICCounterTracksDeleteAndSweep(t *testing.T) {
 func TestWarnStoreFull_NamesTheBudgetThatIsFull(t *testing.T) {
 	// Fill only the QUIC share of the global store.
 	resetStore(t)
-	old := store.max
-	store.max = 4
-	t.Cleanup(func() { store.max = old; lastStoreFullWarn.Store(0) })
+	old := store.Max()
+	store.max.Store(4)
+	t.Cleanup(func() { store.max.Store(int64(old)); lastStoreFullWarn.Store(0) })
 	for i := 0; i < 2; i++ {
 		store.Store(quicAddrConn(i), TLSFingerprint{JA3: "q"})
 	}

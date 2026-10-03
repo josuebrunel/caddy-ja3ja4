@@ -78,6 +78,20 @@ example.com {
 
 > **Warning:** Enabling this may increase false positives because some legitimate tools (curl, browsers) may produce the same JA3 hash as bots that randomize extensions.
 
+#### `max_entries`
+
+How many connections' fingerprints the store may hold at once (default `100000`). QUIC (HTTP/3) connections may use at most half of it, so a flood of QUIC handshakes can't leave TCP clients without a fingerprint. Once the store is full, new connections get empty placeholders until entries are freed, and a rate-limited warning is logged.
+
+```caddyfile
+example.com {
+    ja3_ja4 {
+        max_entries 250000
+    }
+}
+```
+
+The store is shared by every server in the process: it grows to the largest `max_entries` any handler asks for and never shrinks. In JSON it is the `max_entries` field of the `ja3_ja4` handler.
+
 ### JSON Configuration
 
 ```json

@@ -106,11 +106,14 @@ func (m *HandshakeContextModule) Provision(ctx caddy.Context) error {
 
 // UnmarshalCaddyfile sets up from Caddyfile (for direct use, not via HTTP handler).
 func (m *HandshakeContextModule) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	sorted, err := parseSortOption(d)
+	opts, err := parseOptions(d)
 	if err != nil {
 		return err
 	}
-	m.SortJA3Extensions = sorted
+	if opts.maxEntries != 0 {
+		return d.Err("max_entries is an option of the ja3_ja4 handler, not of this module")
+	}
+	m.SortJA3Extensions = opts.sortExtensions
 	return nil
 }
 
@@ -147,7 +150,7 @@ func warnStoreFull(logger *zap.Logger, transport Transport) {
 		return
 	}
 	logger.Warn("fingerprint store is full; dropping fingerprints for new connections",
-		zap.Int("max_entries", store.max))
+		zap.Int("max_entries", store.Max()))
 }
 
 // Interface compliance.

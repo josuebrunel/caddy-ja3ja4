@@ -2,6 +2,8 @@ package ja3ja4
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -70,6 +72,14 @@ type JA3JA4 struct {
 	// Default: false (preserve wire order per the JA3 specification).
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
+	// MaxEntries is how many connections' fingerprints the store may hold at
+	// once (QUIC connections may use at most half of that). Once it is full,
+	// new connections get no fingerprint until entries are freed. The store is
+	// shared by every server in the process and fits the largest value any
+	// handler asks for.
+	// Default: 100000.
+	MaxEntries int `json:"max_entries,omitempty"`
+
 	logger   *zap.Logger
 	sweeping bool              // whether Provision acquired the shared sweeper
 	srv      *caddyhttp.Server // server whose hooks Provision acquired
@@ -110,6 +120,9 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 	m.srv = srv
 
 	store.EnsureTTL(ttlForIdleTimeout(time.Duration(srv.IdleTimeout)))
+	if m.MaxEntries > 0 {
+		store.EnsureMax(m.MaxEntries)
+	}
 	store.AcquireSweeper()
 	m.sweeping = true
 
@@ -175,37 +188,67 @@ func (m *JA3JA4) Cleanup() error {
 
 // Validate ensures the module configuration is valid.
 func (m *JA3JA4) Validate() error {
+	if m.MaxEntries < 0 {
+		return fmt.Errorf("max_entries must not be negative, got %d", m.MaxEntries)
+	}
 	return nil
 }
 
 // UnmarshalCaddyfile sets up from Caddyfile.
 func (m *JA3JA4) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	sorted, err := parseSortOption(d)
+	opts, err := parseOptions(d)
 	if err != nil {
 		return err
 	}
-	m.SortJA3Extensions = sorted
+	m.SortJA3Extensions = opts.sortExtensions
+	m.MaxEntries = opts.maxEntries
 	return nil
 }
 
-// parseSortOption parses the directive block shared by the handler and the TLS
-// context module: the only subdirective is the argument-less
-// sort_ja3_extensions flag.
-func parseSortOption(d *caddyfile.Dispenser) (sortExtensions bool, err error) {
+// options are the settings a ja3_ja4 directive block can carry.
+type options struct {
+	sortExtensions bool
+	maxEntries     int // 0 when not set
+}
+
+// parseOptions parses the directive block shared by the handler and the TLS
+// context module:
+//
+//	ja3_ja4 {
+//		sort_ja3_extensions
+//		max_entries <n>
+//	}
+func parseOptions(d *caddyfile.Dispenser) (options, error) {
+	var opts options
 	for d.Next() {
 		for nesting := d.Nesting(); d.NextBlock(nesting); {
 			switch d.Val() {
 			case "sort_ja3_extensions":
 				if d.NextArg() {
-					return false, d.ArgErr()
+					return options{}, d.ArgErr()
 				}
-				sortExtensions = true
+				opts.sortExtensions = true
+			case "max_entries":
+				if opts.maxEntries != 0 {
+					return options{}, d.Err("max_entries specified more than once")
+				}
+				if !d.NextArg() {
+					return options{}, d.ArgErr()
+				}
+				n, err := strconv.Atoi(d.Val())
+				if err != nil || n <= 0 {
+					return options{}, d.Errf("max_entries must be a positive integer, got %q", d.Val())
+				}
+				if d.NextArg() {
+					return options{}, d.ArgErr()
+				}
+				opts.maxEntries = n
 			default:
-				return false, d.Errf("unrecognized subdirective: %s", d.Val())
+				return options{}, d.Errf("unrecognized subdirective: %s", d.Val())
 			}
 		}
 	}
-	return sortExtensions, nil
+	return opts, nil
 }
 
 // parseCaddyfile parses the Caddyfile directive.

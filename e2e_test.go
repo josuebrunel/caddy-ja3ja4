@@ -686,8 +686,8 @@ func TestE2E_QUICFloodDoesNotStarveTCPClients(t *testing.T) {
 		t.Skip("skipping under -race: upstream Caddy data race in TLS.Start (see TestE2E_HTTP3)")
 	}
 	srv := startCaddy(t, "", "servers {\n\t\tprotocols h1 h2 h3\n\t}")
-	store.max = 100 // small cap so the test is quick; the default is 100,000
-	t.Cleanup(func() { store.max = defaultMaxEntries })
+	store.max.Store(100) // small cap so the test is quick; the default is 100,000
+	t.Cleanup(func() { store.max.Store(defaultMaxEntries) })
 
 	floodUnansweredQUIC(t, srv, 250) // far more than the cap
 
@@ -695,7 +695,7 @@ func TestE2E_QUICFloodDoesNotStarveTCPClients(t *testing.T) {
 	fp, _, _ := e2eGet(t, c, srv)
 	if fp.JA3 == "" || fp.JA4 == "" {
 		t.Errorf("a TCP client got no fingerprint while %d/%d store slots were taken by unanswered QUIC handshakes",
-			store.Len(), store.max)
+			store.Len(), store.Max())
 	}
 }
 
@@ -735,5 +735,26 @@ func TestE2E_UnreadQUICEntriesExpireButServedOnesSurvive(t *testing.T) {
 
 	if store.Len() != 1 {
 		t.Errorf("after the unread window %d entries remain, want only the served HTTP/3 client's", store.Len())
+	}
+}
+
+// max_entries from the Caddyfile must reach the store; with several handlers
+// the largest value wins and the store never shrinks.
+func TestE2E_MaxEntriesOption(t *testing.T) {
+	old := store.Max()
+	t.Cleanup(func() { store.max.Store(int64(old)) }) // production only grows; don't leak into other tests
+	startCaddy(t, `
+		ja3_ja4 {
+			max_entries 250000
+		}
+		ja3_ja4 {
+			max_entries 180000
+		}
+		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`)
+	if got := store.Max(); got < 250_000 {
+		t.Errorf("store capacity = %d, want at least 250000 from max_entries", got)
+	}
+	if got, want := store.quicBudget(), store.max.Load()/2; got != want {
+		t.Errorf("QUIC budget = %d, want half of %d", got, store.max.Load())
 	}
 }
