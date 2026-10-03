@@ -3,6 +3,7 @@ package ja3ja4
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"testing"
 )
 
@@ -112,4 +113,26 @@ func BenchmarkSweep(b *testing.B) {
 	for b.Loop() {
 		s.sweep(s.TTL())
 	}
+}
+
+// tcpConn reports a real *net.TCPAddr like an accepted connection does, so the
+// cost of deriving the store key from it is visible (mockConn hides it).
+type tcpConn struct {
+	net.Conn
+	remote *net.TCPAddr
+}
+
+func (c *tcpConn) RemoteAddr() net.Addr { return c.remote }
+
+// BenchmarkStoreLoad_TCPAddr is the per-request lookup with a real TCP address.
+func BenchmarkStoreLoad_TCPAddr(b *testing.B) {
+	s := NewFingerprintStore()
+	c := &tcpConn{remote: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 50321}}
+	s.Store(c, TLSFingerprint{JA3: "x"})
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			s.Load(c)
+		}
+	})
 }

@@ -4,12 +4,11 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/tls"
-	"fmt"
+	"encoding/hex"
 	"net"
+	"net/netip"
 	"slices"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,7 +75,7 @@ func NewFingerprintStore() *FingerprintStore {
 }
 
 // shard returns the partition responsible for key (FNV-1a, allocation-free).
-func (s *FingerprintStore) shard(key string) *storeShard {
+func shard[K ~string | ~[]byte](s *FingerprintStore, key K) *storeShard {
 	h := uint32(2166136261)
 	for i := 0; i < len(key); i++ {
 		h ^= uint32(key[i])
@@ -137,7 +136,7 @@ func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 	e := &fingerprintEntry{fp: fp}
 	e.lastSeen.Store(time.Now().UnixNano())
 
-	sh := s.shard(key)
+	sh := shard(s, key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if _, exists := sh.m[key]; !exists {
@@ -155,7 +154,22 @@ func (s *FingerprintStore) Store(conn net.Conn, fp TLSFingerprint) bool {
 
 // Load retrieves the fingerprint for the given connection.
 func (s *FingerprintStore) Load(conn net.Conn) (TLSFingerprint, bool) {
-	return s.LoadByRemoteAddr(connKey(conn))
+	// Build the key on the stack: a lookup runs on every request and must not
+	// allocate (net.Addr.String would, several times).
+	var buf [64]byte
+	key := appendConnKey(buf[:0], conn)
+	if len(key) == 0 {
+		return TLSFingerprint{}, false
+	}
+	sh := shard(s, key)
+	sh.mu.RLock()
+	e, ok := sh.m[string(key)] // the compiler elides this conversion for lookups
+	sh.mu.RUnlock()
+	if !ok {
+		return TLSFingerprint{}, false
+	}
+	e.lastSeen.Store(time.Now().UnixNano())
+	return e.fp, true
 }
 
 // LoadByRemoteAddr retrieves the fingerprint by remote address string.
@@ -165,7 +179,7 @@ func (s *FingerprintStore) LoadByRemoteAddr(remoteAddr string) (TLSFingerprint, 
 		return TLSFingerprint{}, false
 	}
 
-	sh := s.shard(remoteAddr)
+	sh := shard(s, remoteAddr)
 	sh.mu.RLock()
 	e, ok := sh.m[remoteAddr]
 	sh.mu.RUnlock()
@@ -183,7 +197,7 @@ func (s *FingerprintStore) Delete(conn net.Conn) {
 	if key == "" {
 		return
 	}
-	sh := s.shard(key)
+	sh := shard(s, key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if _, ok := sh.m[key]; ok {
@@ -263,11 +277,37 @@ func (s *FingerprintStore) ReleaseSweeper() {
 	}
 }
 
+// connKey returns the store key of conn: its remote address as host:port.
 func connKey(conn net.Conn) string {
+	var buf [64]byte
+	return string(appendConnKey(buf[:0], conn))
+}
+
+// appendConnKey appends conn's store key to dst. The key is the same text as
+// conn.RemoteAddr().String(), which is also what http.Request.RemoteAddr holds,
+// but TCP and UDP addresses are rendered without allocating. A nil connection
+// or address yields an empty key.
+func appendConnKey(dst []byte, conn net.Conn) []byte {
 	if conn == nil {
-		return ""
+		return dst
 	}
-	return conn.RemoteAddr().String()
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return dst
+	}
+	var ap netip.AddrPort
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ap = a.AddrPort()
+	case *net.UDPAddr:
+		ap = a.AddrPort()
+	}
+	if ap.Addr().IsValid() {
+		// Unmap so an IPv4 client on a dual-stack socket reads "1.2.3.4:80", the
+		// way net.IP.String prints it.
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()).AppendTo(dst)
+	}
+	return append(dst, addr.String()...)
 }
 
 // Global store for fingerprints across all connections.
@@ -311,18 +351,24 @@ func computeFingerprints(chi *tls.ClientHelloInfo, sortExtensions bool) (string,
 // computeJA3 builds the JA3 fingerprint string and its MD5 hash.
 //
 // Go's crypto/tls does not expose the raw ClientHello.client_version field;
-// see ja3Version for how it is reconstructed.
+// see ja3Version for how it is reconstructed. It runs once per handshake, so
+// the string is assembled in a single buffer rather than field by field.
 func computeJA3(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string) {
-	version := ja3Version(chi)
-	ciphers := ja3Ciphers(chi)
-	extensions := ja3Extensions(chi, sortExtensions)
-	curves := ja3Curves(chi, sortExtensions)
-	pointFormats := ja3PointFormats(chi, sortExtensions)
+	var scratch [512]byte // a browser-sized JA3 string fits; append grows if not
+	buf := appendJA3Version(scratch[:0], chi)
+	buf = append(buf, ',')
+	buf = appendJA3IDs(buf, chi.CipherSuites, false, true)
+	buf = append(buf, ',')
+	buf = appendJA3IDs(buf, chi.Extensions, sortExtensions, true)
+	buf = append(buf, ',')
+	buf = appendJA3IDs(buf, chi.SupportedCurves, sortExtensions, true)
+	buf = append(buf, ',')
+	buf = appendJA3IDs(buf, chi.SupportedPoints, sortExtensions, false)
 
-	ja3String := fmt.Sprintf("%s,%s,%s,%s,%s", version, ciphers, extensions, curves, pointFormats)
-	hash := md5.Sum([]byte(ja3String))
-
-	return ja3String, fmt.Sprintf("%x", hash)
+	sum := md5.Sum(buf)
+	var hexSum [md5.Size * 2]byte
+	hex.Encode(hexSum[:], sum[:])
+	return string(buf), string(hexSum[:])
 }
 
 // computeJA4 returns the JA4 fingerprint using the ja4plus library.
@@ -372,70 +418,58 @@ const legacyTLSVersion = 0x0303
 // legacy version itself, so the first non-GREASE entry is that value.
 // GREASE entries (RFC 8701) are never counted.
 func ja3Version(chi *tls.ClientHelloInfo) string {
+	return string(appendJA3Version(nil, chi))
+}
+
+func appendJA3Version(dst []byte, chi *tls.ClientHelloInfo) []byte {
 	if slices.Contains(chi.Extensions, extSupportedVersions) {
-		return strconv.Itoa(legacyTLSVersion)
+		return strconv.AppendUint(dst, legacyTLSVersion, 10)
 	}
 	for _, v := range chi.SupportedVersions {
 		if !isGREASE(v) {
-			return strconv.FormatUint(uint64(v), 10)
+			return strconv.AppendUint(dst, uint64(v), 10)
 		}
 	}
-	return "0"
+	return append(dst, '0')
 }
 
 func ja3Ciphers(chi *tls.ClientHelloInfo) string {
-	ciphers := make([]string, 0, len(chi.CipherSuites))
-	for _, cipher := range chi.CipherSuites {
-		if !isGREASE(cipher) {
-			ciphers = append(ciphers, strconv.FormatUint(uint64(cipher), 10))
-		}
-	}
-	return strings.Join(ciphers, "-")
+	return string(appendJA3IDs(nil, chi.CipherSuites, false, true))
 }
 
 func ja3Extensions(chi *tls.ClientHelloInfo, sortExts bool) string {
-	exts := make([]uint16, 0, len(chi.Extensions))
-	for _, ext := range chi.Extensions {
-		if !isGREASE(ext) {
-			exts = append(exts, ext)
-		}
-	}
-	if sortExts {
-		sort.Slice(exts, func(i, j int) bool { return exts[i] < exts[j] })
-	}
-	extStrs := make([]string, len(exts))
-	for i, ext := range exts {
-		extStrs[i] = strconv.FormatUint(uint64(ext), 10)
-	}
-	return strings.Join(extStrs, "-")
+	return string(appendJA3IDs(nil, chi.Extensions, sortExts, true))
 }
 
 func ja3Curves(chi *tls.ClientHelloInfo, sortExts bool) string {
-	curves := make([]uint16, 0, len(chi.SupportedCurves))
-	for _, c := range chi.SupportedCurves {
-		if !isGREASE(uint16(c)) {
-			curves = append(curves, uint16(c))
-		}
-	}
-	if sortExts {
-		sort.Slice(curves, func(i, j int) bool { return curves[i] < curves[j] })
-	}
-	curveStrs := make([]string, len(curves))
-	for i, curve := range curves {
-		curveStrs[i] = strconv.FormatUint(uint64(curve), 10)
-	}
-	return strings.Join(curveStrs, "-")
+	return string(appendJA3IDs(nil, chi.SupportedCurves, sortExts, true))
 }
 
 func ja3PointFormats(chi *tls.ClientHelloInfo, sortExts bool) string {
-	formats := make([]uint8, len(chi.SupportedPoints))
-	copy(formats, chi.SupportedPoints)
-	if sortExts {
-		sort.Slice(formats, func(i, j int) bool { return formats[i] < formats[j] })
+	return string(appendJA3IDs(nil, chi.SupportedPoints, sortExts, false))
+}
+
+// appendJA3IDs appends ids to dst as decimal numbers joined by '-', optionally
+// dropping GREASE values (RFC 8701) and sorting ascending. The input is never
+// modified: GREASE filtering and sorting work on a copy, kept on the stack for
+// the usual few dozen entries.
+func appendJA3IDs[T ~uint8 | ~uint16](dst []byte, ids []T, sorted, dropGREASE bool) []byte {
+	var stack [64]T
+	kept := stack[:0]
+	for _, id := range ids {
+		if dropGREASE && isGREASE(uint16(id)) {
+			continue
+		}
+		kept = append(kept, id)
 	}
-	formatStrs := make([]string, len(formats))
-	for i, format := range formats {
-		formatStrs[i] = strconv.FormatUint(uint64(format), 10)
+	if sorted {
+		slices.Sort(kept)
 	}
-	return strings.Join(formatStrs, "-")
+	for i, id := range kept {
+		if i > 0 {
+			dst = append(dst, '-')
+		}
+		dst = strconv.AppendUint(dst, uint64(id), 10)
+	}
+	return dst
 }

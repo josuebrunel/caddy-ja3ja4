@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -175,6 +176,12 @@ func FuzzComputeJA3(f *testing.F) {
 		}
 
 		computeFingerprints(chi, sortExts)
+
+		// The optimised builder must match the straightforward reference.
+		wantRaw, wantHash := referenceJA3(chi, sortExts)
+		if raw != wantRaw || hash != wantHash {
+			t.Fatalf("JA3 differs from the reference:\n got  %q %s\n want %q %s", raw, hash, wantRaw, wantHash)
+		}
 	})
 }
 
@@ -1063,7 +1070,7 @@ func sweepRefs() int {
 
 // entryFor returns the raw entry stored under key, for tests that need to age it.
 func entryFor(s *FingerprintStore, key string) *fingerprintEntry {
-	sh := s.shard(key)
+	sh := shard(s, key)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	return sh.m[key]
@@ -1076,11 +1083,11 @@ func TestFingerprintStore_SweepOnlyBlocksOneShard(t *testing.T) {
 
 	// Find two keys that live in different shards.
 	keyA := "10.0.0.1:1000"
-	shardA := s.shard(keyA)
+	shardA := shard(s, keyA)
 	var keyB string
 	for port := 1001; ; port++ {
 		keyB = fmt.Sprintf("10.0.0.1:%d", port)
-		if s.shard(keyB) != shardA {
+		if shard(s, keyB) != shardA {
 			break
 		}
 	}
@@ -1242,5 +1249,105 @@ func TestParseSortOption(t *testing.T) {
 				t.Errorf("sort = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestComputeJA3_MatchesReferenceOnRandomHellos(t *testing.T) {
+	rng := mrand.New(mrand.NewSource(1))
+	pick := func(n int, grease bool) []uint16 {
+		out := make([]uint16, n)
+		for i := range out {
+			out[i] = uint16(rng.Intn(70000))
+			if grease && rng.Intn(4) == 0 {
+				g := uint16(rng.Intn(16))<<4 | 0x0a
+				out[i] = g<<8 | g
+			}
+		}
+		return out
+	}
+	for i := 0; i < 3000; i++ {
+		curves := pick(rng.Intn(80), true) // sizes beyond the 64-entry stack scratch too
+		chi := &tls.ClientHelloInfo{
+			SupportedVersions: pick(rng.Intn(4), true),
+			CipherSuites:      pick(rng.Intn(90), true),
+			Extensions:        pick(rng.Intn(90), true),
+			SupportedPoints:   []uint8(string(pick8(rng, rng.Intn(5)))),
+		}
+		for _, c := range curves {
+			chi.SupportedCurves = append(chi.SupportedCurves, tls.CurveID(c))
+		}
+		for _, sorted := range []bool{false, true} {
+			raw, hash := computeJA3(chi, sorted)
+			wantRaw, wantHash := referenceJA3(chi, sorted)
+			if raw != wantRaw || hash != wantHash {
+				t.Fatalf("case %d sorted=%v differs:\n got  %q\n want %q", i, sorted, raw, wantRaw)
+			}
+		}
+	}
+}
+
+func pick8(rng *mrand.Rand, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(rng.Intn(256))
+	}
+	return b
+}
+
+// The allocation-free key builder must produce exactly the text that
+// RemoteAddr().String() (and therefore http.Request.RemoteAddr) has, or the
+// request-side lookup would miss.
+func TestAppendConnKey_MatchesAddrString(t *testing.T) {
+	for _, addr := range []net.Addr{
+		&net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 50321},
+		&net.TCPAddr{IP: net.ParseIP("::ffff:198.51.100.2"), Port: 443}, // IPv4 on a dual-stack socket
+		&net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 8443},
+		&net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 80, Zone: "eth0"},
+		&net.UDPAddr{IP: net.IPv4(192, 0, 2, 33), Port: 4433},
+		&net.UDPAddr{IP: net.ParseIP("2001:db8::2"), Port: 4433},
+		&net.TCPAddr{Port: 9}, // no IP
+		(*net.TCPAddr)(nil),
+		&mockAddr{s: "custom:1234"},
+	} {
+		conn := &addrConn{remote: addr}
+		if got, want := string(appendConnKey(nil, conn)), addr.String(); got != want {
+			t.Errorf("%T %v: key %q, want %q", addr, addr, got, want)
+		}
+		if got := connKey(conn); got != addr.String() {
+			t.Errorf("connKey(%v) = %q, want %q", addr, got, addr.String())
+		}
+	}
+
+	if len(appendConnKey(nil, nil)) != 0 {
+		t.Error("nil connection must give an empty key")
+	}
+	if len(appendConnKey(nil, &addrConn{})) != 0 {
+		t.Error("connection without an address must give an empty key")
+	}
+}
+
+type addrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c *addrConn) RemoteAddr() net.Addr { return c.remote }
+
+// A key built from a real TCP address must find the entry that Store saved
+// under the same connection, and a lookup by the request's RemoteAddr string.
+func TestStore_TCPAddrRoundTrip(t *testing.T) {
+	s := NewFingerprintStore()
+	conn := &addrConn{remote: &net.TCPAddr{IP: net.ParseIP("::ffff:198.51.100.2"), Port: 51000}}
+	s.Store(conn, TLSFingerprint{JA3: "abc"})
+
+	if fp, ok := s.Load(conn); !ok || fp.JA3 != "abc" {
+		t.Errorf("Load(conn) = %+v, %v", fp, ok)
+	}
+	if fp, ok := s.LoadByRemoteAddr("198.51.100.2:51000"); !ok || fp.JA3 != "abc" {
+		t.Errorf("LoadByRemoteAddr(r.RemoteAddr) = %+v, %v", fp, ok)
+	}
+	s.Delete(conn)
+	if _, ok := s.Load(conn); ok {
+		t.Error("entry survived Delete")
 	}
 }
