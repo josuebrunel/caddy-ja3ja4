@@ -698,3 +698,42 @@ func TestE2E_QUICFloodDoesNotStarveTCPClients(t *testing.T) {
 			store.Len(), store.max)
 	}
 }
+
+// Real traffic: the entries of unanswered QUIC handshakes expire after the unread
+// window, while an HTTP/3 client that actually sent a request keeps its entry.
+func TestE2E_UnreadQUICEntriesExpireButServedOnesSurvive(t *testing.T) {
+	if raceEnabled {
+		t.Skip("skipping under -race: upstream Caddy data race in TLS.Start (see TestE2E_HTTP3)")
+	}
+	srv := startCaddy(t, "", "servers {\n\t\tprotocols h1 h2 h3\n\t}")
+
+	// One real HTTP/3 client that keeps its connection (and so its entry).
+	h3 := &http3.Transport{TLSClientConfig: &tls.Config{ServerName: "localhost", InsecureSkipVerify: true}} //nolint:gosec // self-signed test server
+	defer h3.Close()
+	assertFingerprints(t, e2eGetH3(t, h3, srv), "q13d")
+	served := store.Len()
+	if served != 1 {
+		t.Fatalf("store has %d entries after one HTTP/3 request, want 1", served)
+	}
+
+	floodUnansweredQUIC(t, srv, 40)
+	if store.Len() <= served {
+		t.Fatalf("the flood left %d entries, expected more than %d", store.Len(), served)
+	}
+
+	// Jump past the unread window by aging every entry, then sweep like the
+	// background sweeper does.
+	for i := range store.shards {
+		sh := &store.shards[i]
+		sh.mu.RLock()
+		for _, e := range sh.m {
+			e.lastSeen.Store(time.Now().Add(-(unreadQUICTTL + time.Second)).UnixNano())
+		}
+		sh.mu.RUnlock()
+	}
+	store.sweep(store.TTL())
+
+	if store.Len() != 1 {
+		t.Errorf("after the unread window %d entries remain, want only the served HTTP/3 client's", store.Len())
+	}
+}

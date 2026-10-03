@@ -1552,3 +1552,92 @@ func TestWarnStoreFull_NamesTheBudgetThatIsFull(t *testing.T) {
 		t.Errorf("the warning must be rate limited, got %d", logs.Len())
 	}
 }
+
+// ageEntry makes the entry for conn look like it was last seen d ago.
+func ageEntry(s *FingerprintStore, conn net.Conn, d time.Duration) {
+	entryFor(s, connKey(conn)).lastSeen.Store(time.Now().Add(-d).UnixNano())
+}
+
+func TestSweep_UnreadQUICEntriesExpireSooner(t *testing.T) {
+	s := NewFingerprintStore()
+	ttl := s.TTL() // minutes: far longer than unreadQUICTTL
+	age := unreadQUICTTL + 10*time.Second
+
+	unreadQUIC, readQUIC, unreadTCP := quicAddrConn(1), quicAddrConn(2), tcpAddrConn(3)
+	for _, c := range []*addrConn{unreadQUIC, readQUIC, unreadTCP} {
+		s.Store(c, TLSFingerprint{JA3: "x"})
+	}
+	s.Load(readQUIC) // a request used this one
+
+	for _, c := range []*addrConn{unreadQUIC, readQUIC, unreadTCP} {
+		ageEntry(s, c, age)
+	}
+	s.sweep(ttl)
+
+	if entryFor(s, connKey(unreadQUIC)) != nil {
+		t.Error("an unread QUIC entry must expire after unreadQUICTTL")
+	}
+	if entryFor(s, connKey(readQUIC)) == nil {
+		t.Error("a QUIC entry that served a request must live for the normal TTL")
+	}
+	if entryFor(s, connKey(unreadTCP)) == nil {
+		t.Error("a TCP entry must not be swept early: it is deleted when its connection closes, " +
+			"and a client may wait before its first request")
+	}
+
+	// Past the normal TTL everything goes, read or not.
+	for _, c := range []*addrConn{readQUIC, unreadTCP} {
+		ageEntry(s, c, ttl+time.Second)
+	}
+	s.sweep(ttl)
+	if s.Len() != 0 || s.udp.Load() != 0 {
+		t.Errorf("Len=%d udp=%d after the normal TTL, want 0 and 0", s.Len(), s.udp.Load())
+	}
+}
+
+// The unread window never exceeds the sweeper's own TTL.
+func TestSweep_UnreadWindowIsCappedByTTL(t *testing.T) {
+	s := NewFingerprintStore()
+	c := quicAddrConn(1)
+	s.Store(c, TLSFingerprint{JA3: "x"})
+	ageEntry(s, c, 5*time.Second)
+	s.sweep(time.Second) // ttl shorter than unreadQUICTTL
+	if s.Len() != 0 {
+		t.Error("a TTL shorter than the unread window must still expire the entry")
+	}
+}
+
+// Touch (an idle TCP connection) refreshes the clock but does not count as a
+// request using the fingerprint.
+func TestTouch_DoesNotMarkEntryAsRead(t *testing.T) {
+	s := NewFingerprintStore()
+	c := quicAddrConn(1)
+	s.Store(c, TLSFingerprint{JA3: "x"})
+
+	s.Touch(c)
+	if entryFor(s, connKey(c)).read.Load() {
+		t.Fatal("Touch must not mark the entry as read")
+	}
+	ageEntry(s, c, unreadQUICTTL+time.Second)
+	s.Touch(c) // refreshes lastSeen, so the unread entry is young again
+	s.sweep(s.TTL())
+	if s.Len() != 1 {
+		t.Error("Touch must refresh the entry's clock")
+	}
+
+	s.Load(c)
+	if !entryFor(s, connKey(c)).read.Load() {
+		t.Error("Load must mark the entry as read")
+	}
+	s.Touch(nil) // must not panic
+}
+
+func TestLoadByRemoteAddr_MarksEntryAsRead(t *testing.T) {
+	s := NewFingerprintStore()
+	c := quicAddrConn(1)
+	s.Store(c, TLSFingerprint{JA3: "x"})
+	s.LoadByRemoteAddr(TransportQUIC, c.remote.String()) // how an HTTP/3 request finds it
+	if !entryFor(s, connKey(c)).read.Load() {
+		t.Error("an HTTP/3 request's lookup must mark the entry as read")
+	}
+}

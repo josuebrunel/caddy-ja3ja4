@@ -27,6 +27,13 @@ const (
 	ttlMargin = 1 * time.Minute
 	// sweepInterval is how often the background sweeper scans for expired entries.
 	sweepInterval = 1 * time.Minute
+	// unreadQUICTTL is how long a QUIC entry that no request has used yet may
+	// live. QUIC has no close hook, and a handshake that never produces a request
+	// (a scanner, an aborted client, a spoofed source) would otherwise hold its
+	// slot for the whole TTL (the idle timeout plus a minute). A real HTTP/3
+	// client sends its first request within moments of the handshake. Entries
+	// that have served a request are not affected.
+	unreadQUICTTL = 1 * time.Minute
 	// defaultMaxEntries bounds the store so a flood of handshakes cannot grow
 	// it without limit. Entries are normally removed as soon as their
 	// connection closes, so this is only reached under abuse.
@@ -39,6 +46,9 @@ const (
 type fingerprintEntry struct {
 	fp       TLSFingerprint
 	lastSeen atomic.Int64
+	// read is set once a request has looked the entry up. Unread QUIC entries
+	// expire after unreadQUICTTL instead of the full TTL.
+	read atomic.Bool
 }
 
 // shardCount is the number of independently locked partitions of the store.
@@ -123,7 +133,18 @@ func (s *FingerprintStore) TTL() time.Duration {
 // called when a connection goes idle so the idle period is measured from the
 // end of its last request, not from its start.
 func (s *FingerprintStore) Touch(conn net.Conn) {
-	s.Load(conn)
+	var buf [64]byte
+	key := appendConnKey(buf[:0], conn)
+	if len(key) == 0 {
+		return
+	}
+	sh := shard(s, key)
+	sh.mu.RLock()
+	e, ok := sh.m[string(key)]
+	sh.mu.RUnlock()
+	if ok { // refresh the clock only: an idle connection has not used its fingerprint
+		e.lastSeen.Store(time.Now().UnixNano())
+	}
 }
 
 // Store saves a fingerprint for the given connection. It reports whether the
@@ -210,6 +231,7 @@ func (s *FingerprintStore) load(key []byte) (TLSFingerprint, bool) {
 		return TLSFingerprint{}, false
 	}
 	e.lastSeen.Store(time.Now().UnixNano())
+	e.read.Store(true)
 	return e.fp, true
 }
 
@@ -239,9 +261,12 @@ func (s *FingerprintStore) forget(key string) {
 // sweep removes entries that have not been touched (via Store or a Load hit)
 // within ttl. Long-lived, actively-used connections never expire since every
 // lookup refreshes lastSeen; only idle or closed connections' entries age out.
-// It locks one shard at a time.
+// Unread QUIC entries expire sooner (unreadQUICTTL). It locks one shard at a
+// time.
 func (s *FingerprintStore) sweep(ttl time.Duration) {
-	cutoff := time.Now().Add(-ttl).UnixNano()
+	now := time.Now()
+	cutoff := now.Add(-ttl).UnixNano()
+	unreadCutoff := now.Add(-min(ttl, unreadQUICTTL)).UnixNano()
 
 	// One shard at a time, so handshakes and lookups on the other shards are
 	// never held up by a sweep, however large the store has grown.
@@ -249,7 +274,11 @@ func (s *FingerprintStore) sweep(ttl time.Duration) {
 		sh := &s.shards[i]
 		sh.mu.Lock()
 		for key, e := range sh.m {
-			if e.lastSeen.Load() < cutoff {
+			limit := cutoff
+			if isQUICKey(key) && !e.read.Load() {
+				limit = unreadCutoff
+			}
+			if e.lastSeen.Load() < limit {
 				delete(sh.m, key)
 				s.forget(key)
 			}
