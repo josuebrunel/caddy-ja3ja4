@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-coverage lint vet fmt mod-tidy vulncheck clean xcaddy generate-certs docker-build docker-up docker-down
+.PHONY: build test test-race test-coverage bench fuzz lint vet fmt mod-tidy vulncheck clean xcaddy generate-certs docker-build docker-up docker-down
 
 BINARY := caddy
 MODULE := github.com/josuebrunel/caddy-ja3ja4
@@ -14,6 +14,14 @@ test-race:
 
 test-coverage:
 	go test -v -race -coverprofile=coverage.out -short ./...
+
+bench:
+	go test -run '^$$' -bench . -benchmem ./...
+
+# Fuzz the JA3 builder; FUZZTIME=5m for a longer session.
+FUZZTIME ?= 30s
+fuzz:
+	go test -run '^$$' -fuzz FuzzComputeJA3 -fuzztime $(FUZZTIME) .
 
 lint:
 	golangci-lint run --timeout=5m

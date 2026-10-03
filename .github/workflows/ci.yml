@@ -29,11 +29,16 @@ jobs:
       - name: Generate test certificates
         run: make generate-certs
 
-      - name: Run unit tests
+      # Both runs are needed: the race run skips the HTTP/3 end-to-end test
+      # (Caddy v2.11.4 trips the detector itself), so only the plain run covers it.
+      - name: Run tests
         run: make test
 
       - name: Run tests with race detector
         run: make test-race
+
+      - name: Fuzz the JA3 builder
+        run: make fuzz FUZZTIME=30s
 
       - name: Build with xcaddy
         run: |
