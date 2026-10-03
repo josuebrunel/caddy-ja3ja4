@@ -22,6 +22,17 @@ services:
       - XDG_CONFIG_HOME=/config
     restart: unless-stopped
 
+  # Sends requests with different TLS/HTTP settings, so fingerprints show up in
+  # the logs without needing a browser: `make docker-test`.
+  client:
+    image: curlimages/curl:latest
+    profiles: ["tools"]
+    depends_on:
+      - caddy
+    volumes:
+      - ./scripts/test-requests.sh:/test-requests.sh:ro
+    entrypoint: ["/bin/sh", "/test-requests.sh"]
+
 volumes:
   caddy_data:
   caddy_config:

@@ -212,6 +212,29 @@ make xcaddy
 make docker-up
 ```
 
+### Try It With Docker Compose
+
+```bash
+make generate-certs    # self-signed cert for localhost, once
+make docker-test       # build, start, send test requests, show what was logged
+```
+
+`make docker-test` starts Caddy with `Caddyfile.test` on `https://localhost:8443`, runs a small curl client that connects with different HTTP and TLS versions (and a custom User-Agent), then prints one compact line per request:
+
+```json
+{"time":"13:45:14","client":"172.27.0.3","proto":"HTTP/2.0","tls":772,"ja3":"b4033f0c...","ja4":"t13d0311h2_55b375c5d22e_19b07b4d796e","sorted":"false","ua":"curl/8.22.0","status":200}
+```
+
+To test with a browser or your own client, open `https://localhost:8443` (accept the self-signed certificate) and watch the same view live:
+
+```bash
+make docker-logs       # follow the access log, one line per request (needs jq)
+make docker-logs-raw   # Caddy's complete, unfiltered output
+make docker-down
+```
+
+The fingerprints reach the log through `log_append` lines in `Caddyfile.test`, and the one-line view comes from `scripts/access-log.jq`. Times are UTC.
+
 ### Project Structure
 
 ```
@@ -227,6 +250,7 @@ make docker-up
 ├── bench_test.go            # Benchmarks
 ├── helpers_test.go          # Test isolation helpers
 ├── integration_test.go      # Module provisioning tests
+├── scripts/                 # access-log.jq (log view), test-requests.sh (compose client)
 ├── Dockerfile               # Multi-stage Docker build
 ├── docker-compose.yml       # Local test environment
 └── README.md

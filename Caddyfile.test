@@ -7,10 +7,16 @@ localhost:8443 {
 
 	ja3_ja4
 
+	# One JSON access-log line per request, with the fingerprints appended.
+	# Pretty-print with `make docker-logs`.
 	log {
 		output stdout
 		format json
 	}
+	log_append ja3 {tls.ja3}
+	log_append ja4 {tls.ja4}
+	log_append ja3_raw {tls.ja3_raw}
+	log_append ja3_sorted {tls.ja3_sorted}
 
 	respond <<TXT
 		JA3: {tls.ja3}

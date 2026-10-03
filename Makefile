@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-coverage bench fuzz lint vet fmt mod-tidy mod-check vulncheck clean xcaddy generate-certs docker-build docker-up docker-down
+.PHONY: build test test-race test-coverage bench fuzz lint vet fmt mod-tidy mod-check vulncheck clean xcaddy generate-certs docker-build docker-up docker-down docker-logs docker-logs-raw docker-test
 
 BINARY := caddy
 MODULE := github.com/josuebrunel/caddy-ja3ja4
@@ -67,7 +67,22 @@ docker-build:
 	docker compose build
 
 docker-up:
-	docker compose up -d
+	docker compose up -d --build
 
 docker-down:
 	docker compose down
+
+# Follow the access log, one compact line per request (needs jq).
+docker-logs:
+	docker compose logs -f --no-log-prefix --since 1m caddy | jq --unbuffered -R -c -f scripts/access-log.jq
+
+# Follow Caddy's complete, unfiltered log output.
+docker-logs-raw:
+	docker compose logs -f --no-log-prefix --since 1m caddy
+
+# Start the stack, send requests with different TLS/HTTP settings, show what was logged.
+docker-test: docker-up
+	docker compose --profile tools run --rm client
+	@echo
+	@echo "--- access log ---"
+	@docker compose logs --no-log-prefix --since 1m caddy | jq -R -c -f scripts/access-log.jq
