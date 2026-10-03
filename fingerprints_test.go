@@ -1018,3 +1018,65 @@ func TestHandshakeContextModule_StillRecords(t *testing.T) {
 		t.Errorf("fingerprint not recorded: %+v ok=%v", fp, ok)
 	}
 }
+
+func TestFingerprintStore_SharedSweeperIsRefCounted(t *testing.T) {
+	s := NewFingerprintStore()
+
+	s.AcquireSweeper()
+	s.AcquireSweeper()
+	s.AcquireSweeper()
+	if s.sweepStarts != 1 {
+		t.Fatalf("3 users started %d sweepers, want 1", s.sweepStarts)
+	}
+
+	s.ReleaseSweeper()
+	s.ReleaseSweeper()
+	if s.sweepCancel == nil {
+		t.Fatal("sweeper stopped while a user was still holding it")
+	}
+	s.ReleaseSweeper()
+	if s.sweepCancel != nil || s.sweepRefs != 0 {
+		t.Fatal("sweeper must stop once the last user releases it")
+	}
+
+	s.ReleaseSweeper() // an unbalanced release must be harmless
+	if s.sweepRefs != 0 {
+		t.Errorf("refs went negative: %d", s.sweepRefs)
+	}
+
+	s.AcquireSweeper()
+	if s.sweepStarts != 2 {
+		t.Errorf("a new user after a full stop must start a fresh sweeper, starts = %d", s.sweepStarts)
+	}
+	s.ReleaseSweeper()
+}
+
+func TestJA3JA4_CleanupReleasesOnlyWhatItAcquired(t *testing.T) {
+	before := sweepRefs()
+
+	unprovisioned := &JA3JA4{}
+	if err := unprovisioned.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sweepRefs(); got != before {
+		t.Errorf("Cleanup of a never-provisioned handler changed the refcount: %d -> %d", before, got)
+	}
+
+	m := &JA3JA4{}
+	store.AcquireSweeper()
+	m.sweeping = true
+	for i := 0; i < 2; i++ { // Cleanup twice must release once
+		if err := m.Cleanup(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := sweepRefs(); got != before {
+		t.Errorf("refcount after Cleanup = %d, want %d", got, before)
+	}
+}
+
+func sweepRefs() int {
+	store.sweepMu.Lock()
+	defer store.sweepMu.Unlock()
+	return store.sweepRefs
+}

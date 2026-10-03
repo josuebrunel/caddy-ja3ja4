@@ -47,6 +47,11 @@ type FingerprintStore struct {
 	m   map[string]*fingerprintEntry
 	max int
 	ttl atomic.Int64 // time.Duration; see EnsureTTL
+
+	sweepMu     sync.Mutex
+	sweepRefs   int
+	sweepCancel context.CancelFunc
+	sweepStarts int // how many sweeper goroutines have been started (for tests)
 }
 
 // NewFingerprintStore creates a new fingerprint store.
@@ -181,6 +186,36 @@ func (s *FingerprintStore) StartSweeper(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// AcquireSweeper starts the background sweeper if no one else has, and counts
+// the caller as a user of it. Every call must be paired with ReleaseSweeper.
+// The store is global and shared by every handler instance, so they share one
+// goroutine instead of each sweeping the same map.
+func (s *FingerprintStore) AcquireSweeper() {
+	s.sweepMu.Lock()
+	defer s.sweepMu.Unlock()
+	s.sweepRefs++
+	if s.sweepRefs == 1 {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.sweepCancel = cancel
+		s.sweepStarts++
+		s.StartSweeper(ctx)
+	}
+}
+
+// ReleaseSweeper drops one user of the sweeper and stops it when none remain.
+func (s *FingerprintStore) ReleaseSweeper() {
+	s.sweepMu.Lock()
+	defer s.sweepMu.Unlock()
+	if s.sweepRefs == 0 {
+		return
+	}
+	s.sweepRefs--
+	if s.sweepRefs == 0 {
+		s.sweepCancel()
+		s.sweepCancel = nil
+	}
 }
 
 func connKey(conn net.Conn) string {

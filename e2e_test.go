@@ -470,3 +470,33 @@ func TestE2E_TTLFollowsConfiguredIdleTimeout(t *testing.T) {
 		t.Errorf("store TTL = %v, want at least %v for idle_timeout 20m", got, want)
 	}
 }
+
+// Several handler instances must share one sweeper, and unloading the config
+// must release it.
+func TestE2E_HandlersShareOneSweeper(t *testing.T) {
+	store.sweepMu.Lock()
+	startsBefore, refsBefore := store.sweepStarts, store.sweepRefs
+	store.sweepMu.Unlock()
+
+	startCaddy(t, `
+		ja3_ja4
+		ja3_ja4
+		respond "{tls.ja3}|{tls.ja4}|{tls.ja3_raw}|{tls.ja3_sorted}"`)
+
+	store.sweepMu.Lock()
+	started, refs := store.sweepStarts-startsBefore, store.sweepRefs-refsBefore
+	store.sweepMu.Unlock()
+	if refs != 2 {
+		t.Fatalf("two handlers hold %d sweeper references, want 2", refs)
+	}
+	if refsBefore == 0 && started != 1 {
+		t.Errorf("two handlers started %d sweeper goroutines, want 1", started)
+	}
+
+	if err := caddy.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sweepRefs(); got != refsBefore {
+		t.Errorf("sweeper references after unloading = %d, want %d", got, refsBefore)
+	}
+}

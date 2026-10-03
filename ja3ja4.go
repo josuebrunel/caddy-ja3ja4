@@ -32,7 +32,8 @@ type JA3JA4 struct {
 	// Default: false (preserve wire order per the JA3 specification).
 	SortJA3Extensions bool `json:"sort_ja3_extensions,omitempty"`
 
-	logger *zap.Logger
+	logger   *zap.Logger
+	sweeping bool // whether Provision acquired the shared sweeper
 }
 
 // CaddyModule returns module info.
@@ -70,7 +71,8 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 	srv.RegisterConnState(connStateFunc)
 
 	store.EnsureTTL(ttlForIdleTimeout(time.Duration(srv.IdleTimeout)))
-	store.StartSweeper(ctx.Context)
+	store.AcquireSweeper()
+	m.sweeping = true
 
 	return nil
 }
@@ -112,6 +114,16 @@ func installMatcher(policies caddytls.ConnectionPolicies, sortExtensions bool, l
 	return nil
 }
 
+// Cleanup releases the shared background sweeper; it stops once the last
+// handler instance is cleaned up.
+func (m *JA3JA4) Cleanup() error {
+	if m.sweeping {
+		m.sweeping = false
+		store.ReleaseSweeper()
+	}
+	return nil
+}
+
 // Validate ensures the module configuration is valid.
 func (m *JA3JA4) Validate() error {
 	return nil
@@ -148,6 +160,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 var (
 	_ caddy.Module                = (*JA3JA4)(nil)
 	_ caddy.Provisioner           = (*JA3JA4)(nil)
+	_ caddy.CleanerUpper          = (*JA3JA4)(nil)
 	_ caddy.Validator             = (*JA3JA4)(nil)
 	_ caddyhttp.MiddlewareHandler = (*JA3JA4)(nil)
 	_ caddyfile.Unmarshaler       = (*JA3JA4)(nil)
