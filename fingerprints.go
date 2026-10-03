@@ -294,10 +294,12 @@ func isGREASE(v uint16) bool {
 	return lo == hi && lo&0x0f == 0x0a
 }
 
-// computeFingerprints computes JA3 (raw + hash) and JA4 from a ClientHello.
+// computeFingerprints computes JA3 (raw + hash) and JA4 from a ClientHello. It
+// is the only place that handles a nil ClientHello (all three results are
+// empty); the functions below require a non-nil one.
 func computeFingerprints(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string, string) {
 	if chi == nil {
-		return "", "n/a", "n/a"
+		return "", "", ""
 	}
 
 	ja3Raw, ja3 := computeJA3(chi, sortExtensions)
@@ -311,10 +313,6 @@ func computeFingerprints(chi *tls.ClientHelloInfo, sortExtensions bool) (string,
 // Go's crypto/tls does not expose the raw ClientHello.client_version field;
 // see ja3Version for how it is reconstructed.
 func computeJA3(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string) {
-	if chi == nil {
-		return "0,,,", ""
-	}
-
 	version := ja3Version(chi)
 	ciphers := ja3Ciphers(chi)
 	extensions := ja3Extensions(chi, sortExtensions)
@@ -329,9 +327,6 @@ func computeJA3(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string) 
 
 // computeJA4 returns the JA4 fingerprint using the ja4plus library.
 func computeJA4(chi *tls.ClientHelloInfo) string {
-	if chi == nil {
-		return "n/a"
-	}
 	return ja4plus.JA4(quicAware(chi))
 }
 
@@ -377,9 +372,6 @@ const legacyTLSVersion = 0x0303
 // legacy version itself, so the first non-GREASE entry is that value.
 // GREASE entries (RFC 8701) are never counted.
 func ja3Version(chi *tls.ClientHelloInfo) string {
-	if chi == nil {
-		return "0"
-	}
 	if slices.Contains(chi.Extensions, extSupportedVersions) {
 		return strconv.Itoa(legacyTLSVersion)
 	}
@@ -392,9 +384,6 @@ func ja3Version(chi *tls.ClientHelloInfo) string {
 }
 
 func ja3Ciphers(chi *tls.ClientHelloInfo) string {
-	if chi == nil || len(chi.CipherSuites) == 0 {
-		return ""
-	}
 	ciphers := make([]string, 0, len(chi.CipherSuites))
 	for _, cipher := range chi.CipherSuites {
 		if !isGREASE(cipher) {
@@ -405,9 +394,6 @@ func ja3Ciphers(chi *tls.ClientHelloInfo) string {
 }
 
 func ja3Extensions(chi *tls.ClientHelloInfo, sortExts bool) string {
-	if chi == nil || len(chi.Extensions) == 0 {
-		return ""
-	}
 	exts := make([]uint16, 0, len(chi.Extensions))
 	for _, ext := range chi.Extensions {
 		if !isGREASE(ext) {
@@ -425,9 +411,6 @@ func ja3Extensions(chi *tls.ClientHelloInfo, sortExts bool) string {
 }
 
 func ja3Curves(chi *tls.ClientHelloInfo, sortExts bool) string {
-	if chi == nil || len(chi.SupportedCurves) == 0 {
-		return ""
-	}
 	curves := make([]uint16, 0, len(chi.SupportedCurves))
 	for _, c := range chi.SupportedCurves {
 		if !isGREASE(uint16(c)) {
@@ -445,9 +428,6 @@ func ja3Curves(chi *tls.ClientHelloInfo, sortExts bool) string {
 }
 
 func ja3PointFormats(chi *tls.ClientHelloInfo, sortExts bool) string {
-	if chi == nil || len(chi.SupportedPoints) == 0 {
-		return ""
-	}
 	formats := make([]uint8, len(chi.SupportedPoints))
 	copy(formats, chi.SupportedPoints)
 	if sortExts {

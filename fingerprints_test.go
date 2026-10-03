@@ -21,20 +21,10 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-func TestComputeJA3_NilInput(t *testing.T) {
-	ja3Raw, ja3 := computeJA3(nil, false)
-	if ja3Raw != "0,,," {
-		t.Errorf("expected ja3Raw='0,,,', got %q", ja3Raw)
-	}
-	if ja3 != "" {
-		t.Errorf("expected empty ja3 hash, got %q", ja3)
-	}
-}
-
 func TestComputeFingerprints_NilInput(t *testing.T) {
 	ja3Raw, ja3, ja4 := computeFingerprints(nil, false)
-	if ja3Raw != "" || ja3 != "n/a" || ja4 != "n/a" {
-		t.Errorf("expected empty/n/a for nil input, got %q %q %q", ja3Raw, ja3, ja4)
+	if ja3Raw != "" || ja3 != "" || ja4 != "" {
+		t.Errorf("expected all-empty results for nil input, got %q %q %q", ja3Raw, ja3, ja4)
 	}
 }
 
@@ -113,24 +103,6 @@ func TestJA3Helpers(t *testing.T) {
 	}
 }
 
-func TestJA3Helpers_NilInput(t *testing.T) {
-	if got := ja3Version(nil); got != "0" {
-		t.Errorf("ja3Version(nil): expected '0', got %q", got)
-	}
-	if got := ja3Ciphers(nil); got != "" {
-		t.Errorf("ja3Ciphers(nil): expected '', got %q", got)
-	}
-	if got := ja3Extensions(nil, false); got != "" {
-		t.Errorf("ja3Extensions(nil): expected '', got %q", got)
-	}
-	if got := ja3Curves(nil, false); got != "" {
-		t.Errorf("ja3Curves(nil): expected '', got %q", got)
-	}
-	if got := ja3PointFormats(nil, false); got != "" {
-		t.Errorf("ja3PointFormats(nil): expected '', got %q", got)
-	}
-}
-
 func TestJA3Extensions_SortingDoesNotMutateInput(t *testing.T) {
 	chi := &tls.ClientHelloInfo{
 		Extensions: []uint16{0x0010, 0x0000, 0x0005},
@@ -203,13 +175,6 @@ func FuzzComputeJA3(f *testing.F) {
 
 		computeFingerprints(chi, sortExts)
 	})
-}
-
-func TestComputeJA4_NilInput(t *testing.T) {
-	ja4 := computeJA4(nil)
-	if ja4 != "n/a" {
-		t.Errorf("expected 'n/a', got %q", ja4)
-	}
 }
 
 func TestFingerprintStore(t *testing.T) {
@@ -304,8 +269,8 @@ func TestComputeJA4_TLS13(t *testing.T) {
 	if ja4 == "" {
 		t.Fatal("JA4 should not be empty")
 	}
-	if ja4 == "n/a" {
-		t.Fatal("JA4 should not be 'n/a' for valid ClientHelloInfo")
+	if ja4 == "" {
+		t.Fatal("JA4 should not be empty for valid ClientHelloInfo")
 	}
 	// JA4 format: t[version][cipher_count][ext_count][alpn]_[hash1]_[hash2]
 	// Must start with 't' (TLS)
@@ -336,7 +301,7 @@ func TestComputeJA4_TLS12(t *testing.T) {
 
 	ja4 := computeJA4(chi)
 
-	if ja4 == "" || ja4 == "n/a" {
+	if ja4 == "" {
 		t.Fatalf("expected valid JA4, got %q", ja4)
 	}
 	if ja4[0] != 't' {
@@ -380,7 +345,7 @@ func TestComputeJA4_MinimalClientHello(t *testing.T) {
 
 	ja4 := computeJA4(chi)
 
-	if ja4 == "" || ja4 == "n/a" {
+	if ja4 == "" {
 		t.Fatalf("expected valid JA4 for minimal ClientHello, got %q", ja4)
 	}
 }
