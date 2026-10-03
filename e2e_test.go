@@ -461,3 +461,12 @@ func TestE2E_SortedFlagMatchesHash(t *testing.T) {
 		prev = n
 	}
 }
+
+// The store TTL must follow the server's idle timeout, otherwise connections
+// kept alive longer than the old fixed 5 minutes lose their fingerprint.
+func TestE2E_TTLFollowsConfiguredIdleTimeout(t *testing.T) {
+	startCaddy(t, "", "servers {\n\t\ttimeouts {\n\t\t\tidle 20m\n\t\t}\n\t}")
+	if got, want := store.TTL(), 20*time.Minute+ttlMargin; got < want {
+		t.Errorf("store TTL = %v, want at least %v for idle_timeout 20m", got, want)
+	}
+}

@@ -937,3 +937,65 @@ func TestInstallMatcher(t *testing.T) {
 		}
 	})
 }
+
+func TestTTLForIdleTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		idle time.Duration
+		want time.Duration
+	}{
+		{0, defaultIdleTimeout + ttlMargin},            // Caddy applies its default
+		{-time.Second, defaultIdleTimeout + ttlMargin}, // nonsense falls back to the default
+		{30 * time.Second, 30*time.Second + ttlMargin}, // shorter than the default is honoured
+		{10 * time.Minute, 10*time.Minute + ttlMargin}, // longer than the old fixed 5m TTL
+		{2 * time.Hour, 2*time.Hour + ttlMargin},
+	} {
+		got := ttlForIdleTimeout(tc.idle)
+		if got != tc.want {
+			t.Errorf("idle %v: ttl = %v, want %v", tc.idle, got, tc.want)
+		}
+		if got <= tc.idle {
+			t.Errorf("idle %v: ttl %v must exceed the idle timeout", tc.idle, got)
+		}
+	}
+}
+
+func TestFingerprintStore_EnsureTTLOnlyGrows(t *testing.T) {
+	s := NewFingerprintStore()
+	base := s.TTL()
+
+	s.EnsureTTL(base / 2)
+	if s.TTL() != base {
+		t.Errorf("a shorter TTL must not shrink the store's: got %v, want %v", s.TTL(), base)
+	}
+	s.EnsureTTL(base * 3)
+	if s.TTL() != base*3 {
+		t.Errorf("TTL = %v, want %v", s.TTL(), base*3)
+	}
+}
+
+// A request can outlive the TTL (large download, slow upstream); the entry must
+// survive until the connection has been idle for a full TTL after it.
+func TestConnStateFunc_IdleRestartsTheTTLClock(t *testing.T) {
+	conn := &mockConn{remoteAddr: &mockAddr{s: "192.0.2.77:6000"}}
+	store.Store(conn, TLSFingerprint{JA3: "x"})
+	t.Cleanup(func() { store.Delete(conn) })
+
+	age := func(d time.Duration) {
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		store.m[connKey(conn)].lastSeen.Store(time.Now().Add(-d).UnixNano())
+	}
+
+	age(2 * time.Hour) // the request has been running for two hours
+	connStateFunc(conn, http.StateIdle)
+	store.sweep(store.TTL())
+	if _, ok := store.Load(conn); !ok {
+		t.Fatal("entry was swept right after the connection went idle")
+	}
+
+	age(2 * time.Hour)
+	store.sweep(store.TTL()) // no idle transition this time
+	if _, ok := store.Load(conn); ok {
+		t.Error("a genuinely stale entry must still be swept")
+	}
+}

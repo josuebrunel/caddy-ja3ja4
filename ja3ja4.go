@@ -2,6 +2,7 @@ package ja3ja4
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -68,6 +69,7 @@ func (m *JA3JA4) Provision(ctx caddy.Context) error {
 	srv.RegisterConnContext(connContextFunc)
 	srv.RegisterConnState(connStateFunc)
 
+	store.EnsureTTL(ttlForIdleTimeout(time.Duration(srv.IdleTimeout)))
 	store.StartSweeper(ctx.Context)
 
 	return nil

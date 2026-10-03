@@ -18,11 +18,13 @@ import (
 )
 
 const (
-	// fingerprintTTL is how long a fingerprint entry may sit unused before the
-	// sweeper reclaims it. It must comfortably exceed Caddy's default idle
-	// timeout so entries for live keep-alive connections are never evicted
-	// (Load/LoadByRemoteAddr refresh the timestamp on every hit).
-	fingerprintTTL = 5 * time.Minute
+	// defaultIdleTimeout mirrors the idle timeout Caddy applies to a server
+	// that doesn't configure one.
+	defaultIdleTimeout = 5 * time.Minute
+	// ttlMargin is added on top of a server's idle timeout to get the
+	// fingerprint TTL, so an entry never expires before Caddy would itself
+	// close the idle connection.
+	ttlMargin = 1 * time.Minute
 	// sweepInterval is how often the background sweeper scans for expired entries.
 	sweepInterval = 1 * time.Minute
 	// defaultMaxEntries bounds the store so a flood of handshakes cannot grow
@@ -44,14 +46,52 @@ type FingerprintStore struct {
 	mu  sync.RWMutex
 	m   map[string]*fingerprintEntry
 	max int
+	ttl atomic.Int64 // time.Duration; see EnsureTTL
 }
 
 // NewFingerprintStore creates a new fingerprint store.
 func NewFingerprintStore() *FingerprintStore {
-	return &FingerprintStore{
+	s := &FingerprintStore{
 		m:   make(map[string]*fingerprintEntry),
 		max: defaultMaxEntries,
 	}
+	s.ttl.Store(int64(ttlForIdleTimeout(0)))
+	return s
+}
+
+// ttlForIdleTimeout returns how long an unused fingerprint entry may live for a
+// server with the given idle timeout (0 means Caddy's default). It must exceed
+// the idle timeout, otherwise a live keep-alive connection could lose its
+// fingerprint while Caddy still holds the connection open.
+func ttlForIdleTimeout(idle time.Duration) time.Duration {
+	if idle <= 0 {
+		idle = defaultIdleTimeout
+	}
+	return idle + ttlMargin
+}
+
+// EnsureTTL raises the TTL to at least d. The store is shared by every server
+// in the process, so it only ever grows to fit the longest idle timeout in
+// use; a shorter value never shrinks it.
+func (s *FingerprintStore) EnsureTTL(d time.Duration) {
+	for {
+		cur := s.ttl.Load()
+		if int64(d) <= cur || s.ttl.CompareAndSwap(cur, int64(d)) {
+			return
+		}
+	}
+}
+
+// TTL returns how long an unused entry is kept.
+func (s *FingerprintStore) TTL() time.Duration {
+	return time.Duration(s.ttl.Load())
+}
+
+// Touch marks the connection's entry as just used, without returning it. It is
+// called when a connection goes idle so the idle period is measured from the
+// end of its last request, not from its start.
+func (s *FingerprintStore) Touch(conn net.Conn) {
+	s.LoadByRemoteAddr(connKey(conn))
 }
 
 // Store saves a fingerprint for the given connection. It reports whether the
@@ -137,7 +177,7 @@ func (s *FingerprintStore) StartSweeper(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.sweep(fingerprintTTL)
+				s.sweep(s.TTL())
 			}
 		}
 	}()

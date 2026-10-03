@@ -75,6 +75,10 @@ func connStateFunc(c net.Conn, state http.ConnState) {
 	switch state {
 	case http.StateClosed, http.StateHijacked:
 		store.Delete(c)
+	case http.StateIdle:
+		// A request may have run for longer than the TTL; restart the clock now
+		// that the connection is waiting for the next one.
+		store.Touch(c)
 	}
 }
 
