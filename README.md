@@ -5,17 +5,18 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/josuebrunel/caddy-ja3ja4)](https://goreportcard.com/report/github.com/josuebrunel/caddy-ja3ja4)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A production-ready Caddy v2 module for TLS fingerprinting using [JA3](https://github.com/salesforce/ja3) and [JA4+](https://github.com/FoxIO-LLC/ja4).
+A Caddy v2 module for TLS fingerprinting using [JA3](https://github.com/salesforce/ja3) and [JA4+](https://github.com/FoxIO-LLC/ja4).
 
 ## Features
 
-- **JA3 Fingerprinting** -- Full JA3 spec implementation: MD5 hash of TLS ClientHello parameters (version, ciphers, extensions, curves, point formats)
-- **JA4 Fingerprinting** -- Spec-compliant JA4 via `github.com/exaring/ja4plus` library
+- **JA3 Fingerprinting** -- MD5 hash of the TLS ClientHello parameters (version, ciphers, extensions, curves, point formats), with GREASE filtered out as the spec requires and the version field reconstructed to match reference implementations
+- **JA4 Fingerprinting** -- JA4 via the `github.com/exaring/ja4plus` library, correctly labelled `t` (TCP) or `q` (QUIC / HTTP/3)
 - **Placeholder Integration** -- Expose fingerprints as `{tls.ja3}`, `{tls.ja4}`, `{tls.ja3_raw}`, and `{tls.ja3_sorted}` for use in logging, routing, headers, and matchers
-- **Bounded Fingerprint Store** -- A sliding-TTL sweeper reclaims idle/closed connections' entries automatically, so long-running servers don't leak memory
+- **Resumed Sessions and HTTP/3** -- Fingerprints are recorded on every ClientHello, so TLS 1.3 session resumption and HTTP/3 connections are covered, not just full TCP handshakes
+- **Bounded Fingerprint Store** -- Entries are dropped when their connection closes, the store is capped, and a shared background sweeper reclaims anything left behind, so long-running servers don't leak memory and handshake floods can't grow it without limit
 - **Extension Sorting** -- Optional `sort_ja3_extensions` flag to counter extension-randomization evasion techniques
-- **Graceful Degradation** -- Safely handles non-TLS connections, HTTP/3, and edge cases
-- **Caddy 2.11+ Compatible** -- Uses `tls.context` HandshakeContext module architecture
+- **Predictable Degradation** -- Requests without a fingerprint (plain HTTP, a full store) get empty placeholders rather than literal `{tls.ja3}` text
+- **Caddy 2.11+ Compatible** -- Hooks in through a `tls.handshake_match` module; no TLS configuration is needed
 
 ## Installation
 
@@ -117,7 +118,9 @@ example.com {
 | `{tls.ja3}` | JA3 MD5 hash (32 hex chars) | `a0e9f5d64349fb13191bc781b58dbe36` |
 | `{tls.ja3_raw}` | Raw JA3 string before hashing | `771,4865-4866,0-23-65281,29-23-24,0` |
 | `{tls.ja4}` | JA4 structured fingerprint | `t13d1516h2_8daaf6152771_02705d924276` |
-| `{tls.ja3_sorted}` | Whether extensions were sorted | `true` or `false` |
+| `{tls.ja3_sorted}` | Whether this fingerprint's JA3 was computed with sorting | `true` or `false` |
+
+All four are empty for a request that has no fingerprint, such as plain HTTP.
 
 ## Usage Examples
 
@@ -195,6 +198,13 @@ make lint
 # Check for known vulnerabilities in dependencies
 make vulncheck
 
+# Benchmarks, and a short fuzz session on the JA3 builder
+make bench
+make fuzz FUZZTIME=30s
+
+# Check go.mod is tidy (what CI runs)
+make mod-check
+
 # Build with xcaddy
 make xcaddy
 
@@ -207,13 +217,16 @@ make docker-up
 ```
 .
 ├── cmd/caddy/main.go        # Standalone binary entry point
-├── ja3ja4.go                # Module registration, Provision, Caddyfile parsing
-├── fingerprints.go          # JA3/JA4 computation + FingerprintStore
-├── fingerprints_test.go     # Unit tests for fingerprint computation
-├── context_module.go        # tls.context.ja3ja4 HandshakeContext module
-├── handler.go               # HTTP middleware: ServeHTTP + ConnContext
-├── integration_test.go      # Integration tests
-├── go.mod
+├── ja3ja4.go                # ja3_ja4 handler: Provision/Cleanup, matcher installation, Caddyfile parsing
+├── handler.go               # ServeHTTP, plus the ConnContext/ConnState hooks
+├── context_module.go        # tls.handshake_match.ja3ja4 (records fingerprints) and the legacy tls.context.ja3ja4
+├── fingerprints.go          # JA3/JA4 computation + the sharded FingerprintStore
+├── fingerprints_test.go     # Unit tests (incl. known-answer vectors)
+├── e2e_test.go              # End-to-end tests against a real in-process Caddy
+├── reference_test.go        # Simple JA3 builder used as an oracle for the optimised one
+├── bench_test.go            # Benchmarks
+├── helpers_test.go          # Test isolation helpers
+├── integration_test.go      # Module provisioning tests
 ├── Dockerfile               # Multi-stage Docker build
 ├── docker-compose.yml       # Local test environment
 └── README.md
@@ -223,30 +236,44 @@ make docker-up
 
 ### How It Works
 
-1. **Provision Phase**: When the `ja3_ja4` handler is provisioned, it:
+1. **Provision Phase**: When a `ja3_ja4` handler is provisioned, it:
    - Gets the current `*caddyhttp.Server` from context
-   - Injects `{"module": "ja3ja4"}` into every `TLSConnPolicy.HandshakeContextRaw`
-   - Registers a `ConnContext` callback to store `net.Conn` in request context
+   - Adds a `tls.handshake_match.ja3ja4` matcher to every TLS connection policy of that server (the first handler's `sort_ja3_extensions` wins, see below)
+   - Registers `ConnContext` and `ConnState` callbacks, once per server
+   - Joins the shared background sweeper and sizes the store TTL from the server's idle timeout
 
-2. **TLS Handshake Phase**: When a client connects:
-   - Caddy invokes `HandshakeContextModule.HandshakeContext(hello)`
-   - JA3 is computed in pure Go (version, ciphers, extensions, curves, point formats)
-   - JA4 is computed via `github.com/exaring/ja4plus`
-   - Fingerprints are stored in a `sync.RWMutex`-protected map keyed by `conn.RemoteAddr()`, each entry carrying a last-seen timestamp
+2. **TLS Handshake Phase**: For every ClientHello, including resumed TLS 1.3 sessions and QUIC handshakes, Caddy evaluates the connection policies' matchers:
+   - The matcher computes JA3 in pure Go and JA4 through `github.com/exaring/ja4plus`
+   - The result is stored in a sharded, lock-protected map keyed by the connection's remote address
+   - The matcher always returns true, so it never changes which policy is selected
 
 3. **HTTP Request Phase**: When the request reaches the handler:
-   - The `net.Conn` is retrieved from request context (via `ConnContext`)
+   - The `net.Conn` is taken from the request context (set by `ConnContext`), or the request's remote address is used for HTTP/3
    - The fingerprint is looked up in the store
-   - Placeholders are set on the replacer: `{tls.ja3}`, `{tls.ja4}`, etc.
+   - Placeholders are set on the replacer: `{tls.ja3}`, `{tls.ja4}`, etc. (empty if nothing was found)
+
+4. **Cleanup**: When Caddy reports the connection closed (or hijacked), `ConnState` deletes its entry.
 
 ### Why This Design?
 
+- **A matcher, not the handshake context**: Caddy's `HandshakeContext` hook only runs while a certificate is being selected, which resumed TLS 1.3 sessions skip. Connection-policy matchers run for every ClientHello. (`tls.context.ja3ja4` is still registered so existing JSON configs that reference it keep working, but the handler no longer installs it.)
 - **Per-connection, not per-module**: Fingerprints are keyed by connection, not tied to a single handler instance
-- **Compatible with Caddy 2.11+**: Uses the `tls.context` HandshakeContext mechanism
-- **Thread-safe**: `sync.RWMutex` guards the map; per-entry last-seen timestamps use `atomic.Int64` so reads don't need the write lock
-- **Bounded memory**: A background sweeper (started in `Provision`, tied to the module's Caddy context) reclaims entries that go untouched past a TTL. Every lookup refreshes an entry's timestamp, so long-lived keep-alive connections are never evicted while still active -- only idle or closed ones age out
+- **Bounded memory**: Entries are removed when their connection closes, the store holds at most 100,000 entries (new ones are dropped, with a rate-limited warning, once it is full), and a sweeper drops entries unused for the server's idle timeout plus a minute. Every lookup, and every transition to idle, refreshes an entry, so live keep-alive connections are never evicted
+- **No global lock**: The store is split into 32 shards, so handshakes, request lookups and the sweeper rarely contend
 
 ## Known Limitations
+
+### Fingerprinting is per server
+
+The matcher is installed in every TLS connection policy of a Caddy server, i.e. every site sharing a listening port, as soon as one of them uses `ja3_ja4`. Handlers can't be tied to individual policies, because a policy is chosen from the ClientHello before any route runs. So `sort_ja3_extensions` is effectively server-wide: the first handler's setting wins and a later handler asking for something different logs a warning. `{tls.ja3_sorted}` always reports what was actually used.
+
+### HTTP/3 entries age out instead of being deleted
+
+`ConnState` only exists for TCP connections, so QUIC connections' entries are removed by the sweeper once they've been unused for the idle timeout plus a minute, not at connection close.
+
+### The store is capped
+
+If more than 100,000 connections are tracked at once (or a flood of handshakes arrives faster than they close), fingerprints for new connections are dropped until space frees up, and their placeholders are empty.
 
 ### GREASE Filtering
 
@@ -254,6 +281,10 @@ GREASE values (RFC 8701: `0x?A?A` pattern) are filtered from the version,
 cipher suites, extensions, and elliptic curves before hashing, matching the canonical JA3
 specification. If you compare against fingerprints generated by a tool that does
 *not* filter GREASE, the hashes will differ.
+
+### JA3 Version Field
+
+Go's `crypto/tls` doesn't expose the raw `client_version` field. The module reconstructs it: `771` (`0x0303`) whenever the client sent the `supported_versions` extension, which RFC 8446 requires, and otherwise the first non-GREASE version Go reports. For compliant clients this matches what Wireshark/tshark and other reference tools produce.
 
 ## Security Considerations
 
