@@ -593,3 +593,78 @@ func TestServeHTTP_NoConn_CallsNext(t *testing.T) {
 		t.Error("next handler was not called when conn missing")
 	}
 }
+
+func TestJA3Version(t *testing.T) {
+	tests := []struct {
+		name string
+		chi  *tls.ClientHelloInfo
+		want string
+	}{
+		{
+			name: "GREASE first with supported_versions extension (Chrome-like)",
+			chi: &tls.ClientHelloInfo{
+				SupportedVersions: []uint16{0x5a5a, tls.VersionTLS13, tls.VersionTLS12},
+				Extensions:        []uint16{0x0a0a, 0, 43, 16},
+			},
+			want: "771",
+		},
+		{
+			name: "TLS 1.3 client without GREASE reports legacy version",
+			chi: &tls.ClientHelloInfo{
+				SupportedVersions: []uint16{tls.VersionTLS13, tls.VersionTLS12},
+				Extensions:        []uint16{0, 43},
+			},
+			want: "771",
+		},
+		{
+			name: "no extension, GREASE entry is skipped",
+			chi: &tls.ClientHelloInfo{
+				SupportedVersions: []uint16{0xcaca, tls.VersionTLS12, tls.VersionTLS11},
+			},
+			want: "771",
+		},
+		{
+			name: "TLS 1.2 only client",
+			chi:  &tls.ClientHelloInfo{SupportedVersions: []uint16{tls.VersionTLS12}},
+			want: "771",
+		},
+		{
+			name: "legacy TLS 1.0 client",
+			chi:  &tls.ClientHelloInfo{SupportedVersions: []uint16{tls.VersionTLS10}},
+			want: "769",
+		},
+		{
+			name: "only GREASE versions",
+			chi:  &tls.ClientHelloInfo{SupportedVersions: []uint16{0x2a2a}},
+			want: "0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ja3Version(tt.chi); got != tt.want {
+				t.Errorf("ja3Version = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A GREASE value in the version list must not change the JA3 hash.
+func TestComputeJA3_GREASEVersionIsStable(t *testing.T) {
+	mk := func(grease uint16) *tls.ClientHelloInfo {
+		return &tls.ClientHelloInfo{
+			SupportedVersions: []uint16{grease, tls.VersionTLS13, tls.VersionTLS12},
+			CipherSuites:      []uint16{0x1301, 0x1302},
+			Extensions:        []uint16{0, 43, 16},
+			SupportedCurves:   []tls.CurveID{tls.X25519, tls.CurveP256},
+			SupportedPoints:   []uint8{0},
+		}
+	}
+	rawA, hashA := computeJA3(mk(0x0a0a), false)
+	rawB, hashB := computeJA3(mk(0xfafa), false)
+	if rawA != rawB || hashA != hashB {
+		t.Errorf("JA3 differs across GREASE values: %q vs %q", rawA, rawB)
+	}
+	if !strings.HasPrefix(rawA, "771,") {
+		t.Errorf("expected JA3 to start with 771, got %q", rawA)
+	}
+}

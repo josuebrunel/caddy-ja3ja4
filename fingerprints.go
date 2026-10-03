@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -170,10 +171,8 @@ func computeFingerprints(chi *tls.ClientHelloInfo, sortExtensions bool) (string,
 
 // computeJA3 builds the JA3 fingerprint string and its MD5 hash.
 //
-// Known deviation: Go's crypto/tls does not expose the raw ClientHello.client_version
-// field. This implementation uses SupportedVersions[0] as a best-effort approximation.
-// For TLS 1.3 clients this yields 0x0304 rather than the legacy 0x0303 that reference
-// implementations (e.g. Wireshark/tshark) produce, so hashes will differ for those clients.
+// Go's crypto/tls does not expose the raw ClientHello.client_version field;
+// see ja3Version for how it is reconstructed.
 func computeJA3(chi *tls.ClientHelloInfo, sortExtensions bool) (string, string) {
 	if chi == nil {
 		return "0,,,", ""
@@ -199,11 +198,33 @@ func computeJA4(chi *tls.ClientHelloInfo) string {
 	return ja4plus.JA4(chi)
 }
 
+// extSupportedVersions is the TLS extension ID of supported_versions (RFC 8446).
+const extSupportedVersions = 43
+
+// legacyTLSVersion is the value RFC 8446 freezes ClientHello.legacy_version at
+// whenever the supported_versions extension is sent.
+const legacyTLSVersion = 0x0303
+
+// ja3Version returns the JA3 SSLVersion field, i.e. ClientHello.client_version.
+//
+// Go does not expose that field directly. When the client sent the
+// supported_versions extension, RFC 8446 pins client_version to 0x0303, so we
+// can report it exactly. Otherwise Go derives SupportedVersions from the
+// legacy version itself, so the first non-GREASE entry is that value.
+// GREASE entries (RFC 8701) are never counted.
 func ja3Version(chi *tls.ClientHelloInfo) string {
-	if chi == nil || len(chi.SupportedVersions) == 0 {
+	if chi == nil {
 		return "0"
 	}
-	return fmt.Sprintf("%d", chi.SupportedVersions[0])
+	if slices.Contains(chi.Extensions, extSupportedVersions) {
+		return strconv.Itoa(legacyTLSVersion)
+	}
+	for _, v := range chi.SupportedVersions {
+		if !isGREASE(v) {
+			return strconv.FormatUint(uint64(v), 10)
+		}
+	}
+	return "0"
 }
 
 func ja3Ciphers(chi *tls.ClientHelloInfo) string {
