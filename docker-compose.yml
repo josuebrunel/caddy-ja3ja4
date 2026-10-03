@@ -5,15 +5,21 @@ services:
       dockerfile: Dockerfile
     container_name: caddy-ja3ja4
     ports:
-      - "80:80"
-      - "443:443"
+      # Caddyfile.test serves https://localhost:8443 (TCP for HTTP/1.1 + HTTP/2,
+      # UDP for HTTP/3).
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
     volumes:
       - ./Caddyfile.test:/etc/caddy/Caddyfile:ro
       - ./testdata:/etc/caddy/certs:ro
       - caddy_data:/data
       - caddy_config:/config
     environment:
-      - ACME_AGREE=true
+      # Where Caddyfile.test looks for cert.pem/key.pem (see `make generate-certs`).
+      - CERT_DIR=/etc/caddy/certs
+      # Keep Caddy's state on the named volumes below instead of under $HOME.
+      - XDG_DATA_HOME=/data
+      - XDG_CONFIG_HOME=/config
     restart: unless-stopped
 
 volumes:

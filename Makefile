@@ -42,6 +42,8 @@ xcaddy:
 generate-certs:
 	mkdir -p testdata
 	openssl req -x509 -newkey rsa:2048 -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj "/CN=localhost" 2>/dev/null
+	# Test-only key: make it readable by the non-root user inside the compose container.
+	chmod 644 testdata/key.pem
 
 docker-build:
 	docker compose build
