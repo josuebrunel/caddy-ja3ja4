@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -14,7 +15,8 @@ type fpCtxKey struct{}
 
 // ServeHTTP implements the middleware handler. It retrieves the net.Conn
 // from the request context, looks up the JA3/JA4 fingerprint in the
-// global store, and sets placeholders on the replacer.
+// global store, and sets placeholders on the replacer (empty when the request
+// has no fingerprint).
 //
 // The lookup order is:
 //  1. TLSFingerprint embedded directly in the request context (via HandshakeContext callback)
@@ -47,17 +49,18 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		fp, found = store.LoadByRemoteAddr(r.RemoteAddr)
 	}
 
+	// Always set the placeholders. Caddy leaves unknown placeholders as literal
+	// text in header values (e.g. header_up X-JA3 {tls.ja3} would send the
+	// string "{tls.ja3}" upstream), so a request without a fingerprint, such as
+	// plain HTTP, gets empty values instead.
+	sorted := ""
 	if found {
-		rp.Set("tls.ja3", fp.JA3)
-		rp.Set("tls.ja4", fp.JA4)
-		rp.Set("tls.ja3_raw", fp.JA3Raw)
-
-		if m.SortJA3Extensions {
-			rp.Set("tls.ja3_sorted", "true")
-		} else {
-			rp.Set("tls.ja3_sorted", "false")
-		}
+		sorted = strconv.FormatBool(m.SortJA3Extensions)
 	}
+	rp.Set("tls.ja3", fp.JA3)
+	rp.Set("tls.ja4", fp.JA4)
+	rp.Set("tls.ja3_raw", fp.JA3Raw)
+	rp.Set("tls.ja3_sorted", sorted)
 
 	return next.ServeHTTP(w, r)
 }

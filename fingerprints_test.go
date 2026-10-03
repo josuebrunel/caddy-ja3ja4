@@ -786,3 +786,26 @@ func TestHandshakeMatcher_RecordsAndAlwaysMatches(t *testing.T) {
 		t.Errorf("matcher did not record the fingerprint: %+v ok=%v", fp, ok)
 	}
 }
+
+// Without a fingerprint the placeholders must resolve to empty strings: Caddy
+// leaves unknown placeholders as literal text in header values, which would
+// send "{tls.ja3}" to the upstream.
+func TestServeHTTP_NoFingerprint_PlaceholdersAreEmpty(t *testing.T) {
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.9:1234" // nothing stored for this address
+
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+	m := &JA3JA4{SortJA3Extensions: true}
+	if err := m.ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range []string{"tls.ja3", "tls.ja4", "tls.ja3_raw", "tls.ja3_sorted"} {
+		// ReplaceKnown(…, "") is exactly what header/header_up do.
+		if got := repl.ReplaceKnown("[{"+key+"}]", ""); got != "[]" {
+			t.Errorf("%s: header-style replacement = %q, want %q", key, got, "[]")
+		}
+	}
+}
