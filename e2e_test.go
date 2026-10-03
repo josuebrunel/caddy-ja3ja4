@@ -43,10 +43,6 @@ type e2eFingerprints struct {
 	HeaderJA3                string // X-JA3 response header, set via the header directive
 }
 
-func (f e2eFingerprints) empty() bool {
-	return f.JA3 == "" && f.JA4 == "" && f.JA3Raw == "" && f.HeaderJA3 == ""
-}
-
 type e2eServer struct {
 	port int
 	url  string
@@ -163,7 +159,7 @@ func e2eClient(srv *e2eServer, tlsCfg *tls.Config) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig: tlsCfg,
 		// A client that only offers http/1.1 must not get h2 prepended.
-		ForceAttemptHTTP2: !(len(tlsCfg.NextProtos) == 1 && tlsCfg.NextProtos[0] == "http/1.1"),
+		ForceAttemptHTTP2: len(tlsCfg.NextProtos) != 1 || tlsCfg.NextProtos[0] != "http/1.1",
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return d.DialContext(ctx, network, fmt.Sprintf("127.0.0.1:%d", srv.port))
 		},
