@@ -1294,9 +1294,9 @@ func pick8(rng *mrand.Rand, n int) []byte {
 	return b
 }
 
-// The allocation-free key builder must produce exactly the text that
-// RemoteAddr().String() (and therefore http.Request.RemoteAddr) has, or the
-// request-side lookup would miss.
+// After the transport prefix, the allocation-free key builder must produce
+// exactly the text that RemoteAddr().String() (and therefore
+// http.Request.RemoteAddr) has, or the request-side lookup would miss.
 func TestAppendConnKey_MatchesAddrString(t *testing.T) {
 	for _, addr := range []net.Addr{
 		&net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 50321},
@@ -1310,11 +1310,12 @@ func TestAppendConnKey_MatchesAddrString(t *testing.T) {
 		&mockAddr{s: "custom:1234"},
 	} {
 		conn := &addrConn{remote: addr}
-		if got, want := string(appendConnKey(nil, conn)), addr.String(); got != want {
+		want := string(rune(transportOf(addr))) + ":" + addr.String()
+		if got := string(appendConnKey(nil, conn)); got != want {
 			t.Errorf("%T %v: key %q, want %q", addr, addr, got, want)
 		}
-		if got := connKey(conn); got != addr.String() {
-			t.Errorf("connKey(%v) = %q, want %q", addr, got, addr.String())
+		if got := connKey(conn); got != want {
+			t.Errorf("connKey(%v) = %q, want %q", addr, got, want)
 		}
 	}
 
@@ -1343,11 +1344,101 @@ func TestStore_TCPAddrRoundTrip(t *testing.T) {
 	if fp, ok := s.Load(conn); !ok || fp.JA3 != "abc" {
 		t.Errorf("Load(conn) = %+v, %v", fp, ok)
 	}
-	if fp, ok := s.LoadByRemoteAddr("198.51.100.2:51000"); !ok || fp.JA3 != "abc" {
-		t.Errorf("LoadByRemoteAddr(r.RemoteAddr) = %+v, %v", fp, ok)
+	if fp, ok := s.LoadByRemoteAddr(TransportTCP, "198.51.100.2:51000"); !ok || fp.JA3 != "abc" {
+		t.Errorf("LoadByRemoteAddr(TCP, r.RemoteAddr) = %+v, %v", fp, ok)
 	}
 	s.Delete(conn)
 	if _, ok := s.Load(conn); ok {
 		t.Error("entry survived Delete")
+	}
+}
+
+func TestTransportOf(t *testing.T) {
+	for _, tc := range []struct {
+		addr net.Addr
+		want Transport
+	}{
+		{&net.TCPAddr{}, TransportTCP},
+		{&net.UDPAddr{}, TransportQUIC},
+		{&mockAddr{s: "x"}, TransportTCP}, // Network() == "tcp"
+		{netAddr("udp"), TransportQUIC},   // a wrapped UDP address
+		{netAddr("quic"), TransportQUIC},
+		{netAddr("unix"), TransportTCP}, // anything else is stream-like
+	} {
+		if got := transportOf(tc.addr); got != tc.want {
+			t.Errorf("transportOf(%s) = %q, want %q", tc.addr.Network(), got, tc.want)
+		}
+	}
+}
+
+// A TCP connection and a QUIC flow can come from the same ip:port (different
+// sockets, same numbers). They must not share or overwrite an entry.
+func TestStore_SameAddressOnTCPAndQUICDoesNotCollide(t *testing.T) {
+	s := NewFingerprintStore()
+	tcp := &addrConn{remote: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 50000}}
+	udp := &addrConn{remote: &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 50000}}
+
+	s.Store(tcp, TLSFingerprint{JA3: "tcp-hash"})
+	s.Store(udp, TLSFingerprint{JA3: "quic-hash"})
+	if s.Len() != 2 {
+		t.Fatalf("Len = %d, want 2 independent entries", s.Len())
+	}
+
+	if fp, _ := s.Load(tcp); fp.JA3 != "tcp-hash" {
+		t.Errorf("TCP connection got %q", fp.JA3)
+	}
+	if fp, _ := s.Load(udp); fp.JA3 != "quic-hash" {
+		t.Errorf("QUIC flow got %q", fp.JA3)
+	}
+	// The request-side fallback selects the entry by transport.
+	if fp, _ := s.LoadByRemoteAddr(TransportTCP, "203.0.113.7:50000"); fp.JA3 != "tcp-hash" {
+		t.Errorf("TCP fallback got %q", fp.JA3)
+	}
+	if fp, _ := s.LoadByRemoteAddr(TransportQUIC, "203.0.113.7:50000"); fp.JA3 != "quic-hash" {
+		t.Errorf("QUIC fallback got %q", fp.JA3)
+	}
+
+	s.Delete(tcp) // TCP closing must not take the QUIC flow's entry with it
+	if _, ok := s.Load(tcp); ok {
+		t.Error("TCP entry survived Delete")
+	}
+	if fp, ok := s.Load(udp); !ok || fp.JA3 != "quic-hash" {
+		t.Errorf("QUIC entry was lost when the TCP connection closed: %+v %v", fp, ok)
+	}
+}
+
+// ServeHTTP must pick the entry of the request's own transport when it has to
+// fall back to the remote address.
+func TestServeHTTP_FallbackUsesRequestTransport(t *testing.T) {
+	resetStore(t)
+	tcp := &addrConn{remote: &net.TCPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 40000}}
+	udp := &addrConn{remote: &net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 40000}}
+	store.Store(tcp, TLSFingerprint{JA3: "tcp-hash"})
+	store.Store(udp, TLSFingerprint{JA3: "quic-hash"})
+
+	for _, tc := range []struct {
+		name  string
+		major int
+		want  string
+	}{
+		{"HTTP/3 request", 3, "quic-hash"},
+		{"HTTP/2 request without a net.Conn", 2, "tcp-hash"},
+		{"HTTP/1.1 request without a net.Conn", 1, "tcp-hash"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repl := caddy.NewReplacer()
+			ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+			req.ProtoMajor = tc.major
+			req.RemoteAddr = "198.51.100.9:40000"
+
+			next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+			if err := (&JA3JA4{}).ServeHTTP(httptest.NewRecorder(), req, next); err != nil {
+				t.Fatal(err)
+			}
+			if got := repl.ReplaceAll("{tls.ja3}", ""); got != tc.want {
+				t.Errorf("{tls.ja3} = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

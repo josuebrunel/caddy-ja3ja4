@@ -268,7 +268,7 @@ The fingerprints reach the log through `log_append` lines in `Caddyfile.test`, a
 
 2. **TLS Handshake Phase**: For every ClientHello, including resumed TLS 1.3 sessions and QUIC handshakes, Caddy evaluates the connection policies' matchers:
    - The matcher computes JA3 in pure Go and JA4 through `github.com/exaring/ja4plus`
-   - The result is stored in a sharded, lock-protected map keyed by the connection's remote address
+   - The result is stored in a sharded, lock-protected map keyed by the connection's transport (TCP or QUIC) and remote address
    - The matcher always returns true, so it never changes which policy is selected
 
 3. **HTTP Request Phase**: When the request reaches the handler:

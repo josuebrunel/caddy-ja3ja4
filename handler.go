@@ -17,12 +17,13 @@ type connCtxKey struct{}
 // global store, and sets placeholders on the replacer (empty when the request
 // has no fingerprint).
 //
-// Fingerprints live in the global store, keyed by the connection's remote
-// address (the handshake context Caddy gives modules never reaches the
-// request, so there is nothing to read from the request context). The lookup
-// order is:
+// Fingerprints live in the global store, keyed by the connection's transport
+// and remote address (the handshake context Caddy gives modules never reaches
+// the request, so there is nothing to read from the request context). The
+// lookup order is:
 //  1. net.Conn value in the request context (set by connContextFunc) → store lookup
-//  2. RemoteAddr from the request → store lookup (HTTP/3, where there is no net.Conn)
+//  2. RemoteAddr from the request → store lookup under the request's transport:
+//     QUIC for HTTP/3, where there is no net.Conn, otherwise TCP
 func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey)
 	if repl == nil {
@@ -42,9 +43,14 @@ func (m *JA3JA4) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	}
 
 	// 2. HTTP/3 has no net.Conn in the request context, so fall back to the
-	// request's remote address.
+	// request's remote address. The transport matters: a TCP connection and a
+	// QUIC flow may share the same ip:port, and only one of them is this request.
 	if !found {
-		fp, found = store.LoadByRemoteAddr(r.RemoteAddr)
+		transport := TransportTCP
+		if r.ProtoMajor == 3 {
+			transport = TransportQUIC
+		}
+		fp, found = store.LoadByRemoteAddr(transport, r.RemoteAddr)
 	}
 
 	// Always set the placeholders. Caddy leaves unknown placeholders as literal

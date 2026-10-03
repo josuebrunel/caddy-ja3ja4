@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -121,7 +122,7 @@ func (s *FingerprintStore) TTL() time.Duration {
 // called when a connection goes idle so the idle period is measured from the
 // end of its last request, not from its start.
 func (s *FingerprintStore) Touch(conn net.Conn) {
-	s.LoadByRemoteAddr(connKey(conn))
+	s.Load(conn)
 }
 
 // Store saves a fingerprint for the given connection. It reports whether the
@@ -157,7 +158,24 @@ func (s *FingerprintStore) Load(conn net.Conn) (TLSFingerprint, bool) {
 	// Build the key on the stack: a lookup runs on every request and must not
 	// allocate (net.Addr.String would, several times).
 	var buf [64]byte
-	key := appendConnKey(buf[:0], conn)
+	return s.load(appendConnKey(buf[:0], conn))
+}
+
+// LoadByRemoteAddr retrieves the fingerprint of a connection that arrived over
+// transport t from remoteAddr (the text of http.Request.RemoteAddr). It is the
+// fallback for requests where the net.Conn is not available, i.e. HTTP/3.
+func (s *FingerprintStore) LoadByRemoteAddr(t Transport, remoteAddr string) (TLSFingerprint, bool) {
+	if remoteAddr == "" {
+		return TLSFingerprint{}, false
+	}
+	var buf [64]byte
+	key := append(buf[:0], byte(t), ':')
+	return s.load(append(key, remoteAddr...))
+}
+
+// load looks up a key built by appendConnKey and refreshes the entry's
+// last-seen time.
+func (s *FingerprintStore) load(key []byte) (TLSFingerprint, bool) {
 	if len(key) == 0 {
 		return TLSFingerprint{}, false
 	}
@@ -168,25 +186,6 @@ func (s *FingerprintStore) Load(conn net.Conn) (TLSFingerprint, bool) {
 	if !ok {
 		return TLSFingerprint{}, false
 	}
-	e.lastSeen.Store(time.Now().UnixNano())
-	return e.fp, true
-}
-
-// LoadByRemoteAddr retrieves the fingerprint by remote address string.
-// This is used as a fallback for HTTP/3 requests where the net.Conn is not available in the request context.
-func (s *FingerprintStore) LoadByRemoteAddr(remoteAddr string) (TLSFingerprint, bool) {
-	if remoteAddr == "" {
-		return TLSFingerprint{}, false
-	}
-
-	sh := shard(s, remoteAddr)
-	sh.mu.RLock()
-	e, ok := sh.m[remoteAddr]
-	sh.mu.RUnlock()
-	if !ok {
-		return TLSFingerprint{}, false
-	}
-
 	e.lastSeen.Store(time.Now().UnixNano())
 	return e.fp, true
 }
@@ -277,16 +276,45 @@ func (s *FingerprintStore) ReleaseSweeper() {
 	}
 }
 
-// connKey returns the store key of conn: its remote address as host:port.
+// Transport is the kind of socket a connection arrived on. It is part of the
+// store key because a TCP connection and a QUIC (UDP) flow can come from the
+// same ip:port, and must not overwrite each other's fingerprint.
+type Transport byte
+
+const (
+	// TransportTCP is a TCP connection (HTTP/1.1, HTTP/2).
+	TransportTCP Transport = 't'
+	// TransportQUIC is a UDP flow carrying QUIC (HTTP/3).
+	TransportQUIC Transport = 'u'
+)
+
+// transportOf reports which transport an address belongs to.
+func transportOf(addr net.Addr) Transport {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return TransportTCP
+	case *net.UDPAddr:
+		return TransportQUIC
+	default:
+		if n := a.Network(); n == "quic" || strings.HasPrefix(n, "udp") {
+			return TransportQUIC
+		}
+		return TransportTCP
+	}
+}
+
+// connKey returns the store key of conn: its transport and remote address, e.g.
+// "t:203.0.113.7:50321".
 func connKey(conn net.Conn) string {
 	var buf [64]byte
 	return string(appendConnKey(buf[:0], conn))
 }
 
-// appendConnKey appends conn's store key to dst. The key is the same text as
-// conn.RemoteAddr().String(), which is also what http.Request.RemoteAddr holds,
-// but TCP and UDP addresses are rendered without allocating. A nil connection
-// or address yields an empty key.
+// appendConnKey appends conn's store key to dst. After the "t:" or "u:"
+// transport prefix, the key is the same text as conn.RemoteAddr().String(),
+// which is also what http.Request.RemoteAddr holds, but TCP and UDP addresses
+// are rendered without allocating. A nil connection or address yields an empty
+// key.
 func appendConnKey(dst []byte, conn net.Conn) []byte {
 	if conn == nil {
 		return dst
@@ -295,6 +323,8 @@ func appendConnKey(dst []byte, conn net.Conn) []byte {
 	if addr == nil {
 		return dst
 	}
+	dst = append(dst, byte(transportOf(addr)), ':')
+
 	var ap netip.AddrPort
 	switch a := addr.(type) {
 	case *net.TCPAddr:

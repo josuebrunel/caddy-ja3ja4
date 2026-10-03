@@ -136,3 +136,16 @@ func BenchmarkStoreLoad_TCPAddr(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkStoreLoadByRemoteAddr is the HTTP/3 request-side lookup by address text.
+func BenchmarkStoreLoadByRemoteAddr(b *testing.B) {
+	s := NewFingerprintStore()
+	c := &tcpConn{remote: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 50321}}
+	s.Store(c, TLSFingerprint{JA3: "x"})
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			s.LoadByRemoteAddr(TransportTCP, "203.0.113.7:50321")
+		}
+	})
+}
