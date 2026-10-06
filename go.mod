@@ -1,11 +1,11 @@
 module github.com/josuebrunel/caddy-ja3ja4
 
-go 1.25.1
+go 1.26.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/exaring/ja4plus v0.0.3
-	github.com/quic-go/quic-go v0.59.1
+	github.com/quic-go/quic-go v0.63.0
 	go.uber.org/zap v1.28.0
 )
 
